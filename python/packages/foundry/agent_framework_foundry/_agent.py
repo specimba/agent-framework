@@ -57,8 +57,6 @@ if TYPE_CHECKING:
     from agent_framework import (
         Agent,
         AgentRunInputs,
-        ChatAndFunctionMiddlewareTypes,
-        ContextProvider,
         MiddlewareTypes,
         ToolTypes,
     )
@@ -353,6 +351,7 @@ class RawFoundryAgentChatClient(  # type: ignore[misc]
         if _uses_foundry_agent_session(conversation_id):
             run_options.pop("previous_response_id", None)
             run_options.pop("conversation", None)
+            run_options.pop("model", None)
             extra_body["agent_session_id"] = conversation_id
         # Non-preview Prompt/Hosted Agent calls need agent_reference in the request body to
         # tell the Responses API which Foundry agent (and version) is in use, since ``model``
@@ -368,7 +367,6 @@ class RawFoundryAgentChatClient(  # type: ignore[misc]
         # Strip tools from request body - Foundry API rejects requests with both
         # agent endpoint and tools present. FunctionTools are invoked client-side
         # by the function invocation layer, not sent to the service.
-        run_options.pop("model", None)
         if not self.allow_preview:
             run_options.pop("tools", None)
             run_options.pop("tool_choice", None)
@@ -507,10 +505,10 @@ class _FoundryAgentChatClient(  # type: ignore[misc]
         .. code-block:: python
 
             from agent_framework import Agent
-            from agent_framework.foundry import FoundryAgentClient
+            from agent_framework.foundry import FoundryAgent
             from azure.identity import AzureCliCredential
 
-            client = FoundryAgentClient(
+            client = FoundryAgent(
                 project_endpoint="https://your-project.services.ai.azure.com",
                 agent_name="my-prompt-agent",
                 agent_version="1",
@@ -610,6 +608,7 @@ class RawFoundryAgent(  # type: ignore[misc]
         credential: AzureCredentialTypes | None = None,
         project_client: AIProjectClient | None = None,
         allow_preview: bool | None = None,
+        default_headers: Mapping[str, str] | None = None,
         tools: FunctionTool | Callable[..., Any] | Sequence[FunctionTool | Callable[..., Any]] | None = None,
         context_providers: Sequence[ContextProvider] | None = None,
         middleware: Sequence[MiddlewareTypes] | None = None,
@@ -639,6 +638,7 @@ class RawFoundryAgent(  # type: ignore[misc]
             credential: Azure credential for authentication.
             project_client: An existing AIProjectClient to use.
             allow_preview: Enables preview opt-in on internally-created AIProjectClient.
+            default_headers: Additional HTTP headers for requests made through the OpenAI client.
             tools: Function tools to provide to the agent. Only ``FunctionTool`` objects are accepted.
             context_providers: Optional context providers for injecting dynamic context.
             middleware: Optional agent-level middleware.
@@ -672,6 +672,7 @@ class RawFoundryAgent(  # type: ignore[misc]
             "credential": credential,
             "project_client": project_client,
             "allow_preview": allow_preview,
+            "default_headers": default_headers,
             "env_file_path": env_file_path,
             "env_file_encoding": env_file_encoding,
         }
@@ -793,7 +794,21 @@ class RawFoundryAgent(  # type: ignore[misc]
         Raises:
             ImportError: If azure-monitor-opentelemetry-exporter is not installed.
         """
+        from agent_framework.observability import (
+            OBSERVABILITY_SETTINGS,
+            create_metric_views,
+            create_resource,
+            enable_instrumentation,
+        )
         from azure.core.exceptions import ResourceNotFoundError
+
+        if OBSERVABILITY_SETTINGS.is_user_disabled:
+            logger.info(
+                "FoundryAgent.configure_azure_monitor(): Skipping setup because instrumentation was "
+                "explicitly disabled via disable_instrumentation(). Call enable_instrumentation(force=True) "
+                "to re-enable, then re-invoke configure_azure_monitor()."
+            )
+            return
 
         client = self.client
         if not isinstance(client, RawFoundryAgentChatClient):
@@ -816,8 +831,6 @@ class RawFoundryAgent(  # type: ignore[misc]
                 "azure-monitor-opentelemetry is required for Azure Monitor integration. "
                 "Install it with: pip install azure-monitor-opentelemetry"
             ) from exc
-
-        from agent_framework.observability import create_metric_views, create_resource, enable_instrumentation
 
         if "resource" not in kwargs:
             kwargs["resource"] = create_resource()
@@ -882,6 +895,7 @@ class FoundryAgent(  # type: ignore[misc]
         credential: AzureCredentialTypes | None = None,
         project_client: AIProjectClient | None = None,
         allow_preview: bool | None = None,
+        default_headers: Mapping[str, str] | None = None,
         tools: FunctionTool | Callable[..., Any] | Sequence[FunctionTool | Callable[..., Any]] | None = None,
         context_providers: Sequence[ContextProvider] | None = None,
         middleware: Sequence[MiddlewareTypes] | None = None,
@@ -924,6 +938,7 @@ class FoundryAgent(  # type: ignore[misc]
                 Set this to ``True`` for HostedAgents that need preview-only
                 session APIs, including lazy service session creation from
                 ``isolation_key``.
+            default_headers: Additional HTTP headers for requests made through the OpenAI client.
             tools: Function tools to provide to the agent. Only ``FunctionTool`` objects are accepted.
             context_providers: Optional context providers.
             middleware: Optional agent-level middleware.
@@ -951,6 +966,7 @@ class FoundryAgent(  # type: ignore[misc]
             credential=credential,
             project_client=project_client,
             allow_preview=allow_preview,
+            default_headers=default_headers,
             tools=tools,
             context_providers=context_providers,
             middleware=middleware,

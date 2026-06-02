@@ -1,7 +1,7 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
+using System;
 using System.Collections.Generic;
-using System.Diagnostics.CodeAnalysis;
 using System.Threading.Tasks;
 using Microsoft.Agents.AI.Workflows.Specialized.Magentic;
 
@@ -26,12 +26,9 @@ namespace Microsoft.Agents.AI.Workflows;
 ///   not supported on the ManagerAgent.
 /// </summary>
 /// <param name="managerAgent"></param>
-[Experimental(DiagnosticConstants.ExperimentalFeatureDiagnostic)]
-public class MagenticWorkflowBuilder(AIAgent managerAgent)
+public class MagenticWorkflowBuilder(AIAgent managerAgent) : OrchestrationBuilderBase<MagenticWorkflowBuilder>
 {
     private readonly List<AIAgent> _team = new();
-    private string? _name;
-    private string? _description;
     private int _maxStalls = TaskLimits.DefaultMaxStallCount;
     private int? _maxRounds;
     private int? _maxResets;
@@ -41,20 +38,6 @@ public class MagenticWorkflowBuilder(AIAgent managerAgent)
     public MagenticWorkflowBuilder AddParticipants(params IEnumerable<AIAgent> agents)
     {
         this._team.AddRange(agents);
-        return this;
-    }
-
-    /// <inheritdoc cref="WorkflowBuilder.WithName(string)"/>
-    public MagenticWorkflowBuilder WithName(string name)
-    {
-        this._name = name;
-        return this;
-    }
-
-    /// <inheritdoc cref="WorkflowBuilder.WithDescription(string)"/>
-    public MagenticWorkflowBuilder WithDescription(string description)
-    {
-        this._description = description;
         return this;
     }
 
@@ -114,33 +97,42 @@ public class MagenticWorkflowBuilder(AIAgent managerAgent)
             ForwardIncomingMessages = false
         };
 
+        Dictionary<AIAgent, ExecutorBinding> teamMap = new(AIAgentIDEqualityComparer.Instance);
         List<ExecutorBinding> teamBindings = [];
         foreach (AIAgent agent in team)
         {
             ExecutorBinding binding = agent.BindAsExecutor(options);
             teamBindings.Add(binding);
+            teamMap[agent] = binding;
 
             result.AddEdge(binding, orchestrator);
         }
 
-        result.AddFanOutEdge(orchestrator, teamBindings)
-              .WithOutputFrom(orchestrator);
+        result.AddFanOutEdge(orchestrator, teamBindings);
 
-        if (!string.IsNullOrWhiteSpace(this._name))
+        this.ApplyOutputDesignations(result, teamMap, "Magentic", () =>
         {
-            result.WithName(this._name);
-        }
+            result.WithOutputFrom(orchestrator);
+            if (teamMap.Count > 0)
+            {
+                result.WithIntermediateOutputFrom([.. teamMap.Values]);
+            }
+        });
 
-        if (!string.IsNullOrWhiteSpace(this._description))
-        {
-            result.WithDescription(this._description);
-        }
-
+        this.ApplyMetadata(result);
         return result;
     }
 
     /// <inheritdoc cref="WorkflowBuilder.Build"/>
-    public Workflow Build() => this.ReduceToWorkflowBuilder().Build();
+    public Workflow Build()
+    {
+        if (this._team.Count == 0)
+        {
+            throw new InvalidOperationException("At least one participant must be added via AddParticipants() before building the workflow.");
+        }
+
+        return this.ReduceToWorkflowBuilder().Build();
+    }
 
     private TaskLimits Limits => new(
         MaxRoundCount: this._maxRounds,

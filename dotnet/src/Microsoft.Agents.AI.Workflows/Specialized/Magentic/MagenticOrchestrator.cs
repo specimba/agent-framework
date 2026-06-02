@@ -2,7 +2,6 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Text.Json.Serialization;
 using System.Threading;
@@ -18,7 +17,6 @@ namespace Microsoft.Agents.AI.Workflows.Specialized.Magentic;
 [JsonDerivedType(typeof(MagenticPlanCreatedEvent))]
 [JsonDerivedType(typeof(MagenticReplannedEvent))]
 [JsonDerivedType(typeof(MagenticProgressLedgerUpdatedEvent))]
-[Experimental(DiagnosticConstants.ExperimentalFeatureDiagnostic)]
 public abstract class MagenticOrchestratorEvent(object? data) : WorkflowEvent(data)
 {
 }
@@ -27,7 +25,6 @@ public abstract class MagenticOrchestratorEvent(object? data) : WorkflowEvent(da
 /// Represents the creation of the initial plan
 /// </summary>
 /// <param name="fullTaskLeger"></param>
-[Experimental(DiagnosticConstants.ExperimentalFeatureDiagnostic)]
 public sealed class MagenticPlanCreatedEvent(ChatMessage fullTaskLeger) : MagenticOrchestratorEvent(fullTaskLeger)
 {
     /// <summary>
@@ -40,7 +37,6 @@ public sealed class MagenticPlanCreatedEvent(ChatMessage fullTaskLeger) : Magent
 /// Represents the creation of a new plan in response to a stall.
 /// </summary>
 /// <param name="fullTaskLeger"></param>
-[Experimental(DiagnosticConstants.ExperimentalFeatureDiagnostic)]
 public sealed class MagenticReplannedEvent(ChatMessage fullTaskLeger) : MagenticOrchestratorEvent(fullTaskLeger)
 {
     /// <summary>
@@ -53,7 +49,6 @@ public sealed class MagenticReplannedEvent(ChatMessage fullTaskLeger) : Magentic
 /// Represents an update to the <see cref="MagenticProgressLedger"/> when running a coordination round.
 /// </summary>
 /// <param name="progressLedger"></param>
-[Experimental(DiagnosticConstants.ExperimentalFeatureDiagnostic)]
 public sealed class MagenticProgressLedgerUpdatedEvent(MagenticProgressLedger progressLedger) : MagenticOrchestratorEvent(progressLedger)
 {
     /// <summary>
@@ -101,6 +96,7 @@ internal class MagenticOrchestrator(AIAgent managerAgent, List<AIAgent> team, Ta
         return base.ConfigureProtocol(protocolBuilder)
                    .SendsMessage<ChatMessage>()
                    .SendsMessage<ResetChatSignal>()
+                   .YieldsOutput<List<ChatMessage>>()
                    .ConfigureRoutes(ConfigureRoutes);
 
         void ConfigureRoutes(RouteBuilder routeBuilder) => routeBuilder.AddPortHandler<MagenticPlanReviewRequest, MagenticPlanReviewResponse>(
@@ -109,7 +105,7 @@ internal class MagenticOrchestrator(AIAgent managerAgent, List<AIAgent> team, Ta
                 out this._planReviewPort);
     }
 
-    private ValueTask SubmitPlanReviewRequestAsync(MagenticTaskContext taskContext, IWorkflowContext workflowContext)
+    private ValueTask SubmitPlanReviewRequestAsync(MagenticTaskContext taskContext, IWorkflowContext workflowContext, bool replanAfterStall = false)
     {
         MagenticProgressLedger? progressLedger = taskContext.ProgressLedger;
         if (progressLedger?.IsStarted is not true)
@@ -117,7 +113,7 @@ internal class MagenticOrchestrator(AIAgent managerAgent, List<AIAgent> team, Ta
             progressLedger = null;
         }
 
-        MagenticPlanReviewRequest request = new(taskContext.TaskLedger!.CurrentPlan, progressLedger, taskContext.IsStalled);
+        MagenticPlanReviewRequest request = new(taskContext.TaskLedger!.CurrentPlan, progressLedger, replanAfterStall);
 
         return this._planReviewPort!.PostRequestAsync(request);
     }
@@ -137,7 +133,6 @@ internal class MagenticOrchestrator(AIAgent managerAgent, List<AIAgent> team, Ta
           to the conversation and enters the inner loop.
         - If revision requested, append the review comments to the chat history,
           trigger replanning via the manager, emit a REPLANNED event, then run the outer loop.
-         
          */
         if (this._taskContext == null || this._taskContext.TaskLedger == null)
         {
@@ -146,7 +141,7 @@ internal class MagenticOrchestrator(AIAgent managerAgent, List<AIAgent> team, Ta
 
         if (this._taskContext.IsTerminated)
         {
-            throw new InvalidOperationException("Magentic Orchestration has already been terminated and cannot process new messages. Please start a new session.");
+            throw new InvalidOperationException("This Magentic orchestration has already terminated. To process new messages, create a new workflow instance.");
         }
 
         if (response.IsApproved)
@@ -161,7 +156,7 @@ internal class MagenticOrchestrator(AIAgent managerAgent, List<AIAgent> team, Ta
         }
     }
 
-    private async ValueTask UpdatePlanAndDelegateAsync(MagenticTaskContext taskContext, IWorkflowContext context, CancellationToken cancellationToken)
+    private async ValueTask UpdatePlanAndDelegateAsync(MagenticTaskContext taskContext, IWorkflowContext context, CancellationToken cancellationToken, bool replanAfterStall = false)
     {
         bool isReplan = taskContext.TaskLedger != null;
 
@@ -177,7 +172,7 @@ internal class MagenticOrchestrator(AIAgent managerAgent, List<AIAgent> team, Ta
 
         if (requirePlanSignoff)
         {
-            await this.SubmitPlanReviewRequestAsync(taskContext, context).ConfigureAwait(false);
+            await this.SubmitPlanReviewRequestAsync(taskContext, context, replanAfterStall).ConfigureAwait(false);
         }
         else
         {
@@ -187,9 +182,27 @@ internal class MagenticOrchestrator(AIAgent managerAgent, List<AIAgent> team, Ta
 
     protected override async ValueTask TakeTurnAsync(List<ChatMessage> messages, IWorkflowContext context, bool? emitEvents, CancellationToken cancellationToken = default)
     {
-        // First Turn: Initialize the task context and send the initial messages to the planner agent
-        this._taskContext ??= new(messages, team, limits, emitEvents, []);
-        await this.UpdatePlanAndDelegateAsync(this._taskContext, context, cancellationToken).ConfigureAwait(false);
+        if (this._taskContext?.IsTerminated == true)
+        {
+            throw new InvalidOperationException("This Magentic orchestration has already terminated. To process new messages, create a new workflow instance.");
+        }
+
+        if (this._taskContext == null)
+        {
+            // First Turn: Initialize the task context and create the initial plan
+            this._taskContext = new(messages, team, limits, emitEvents, []);
+            await this.UpdatePlanAndDelegateAsync(this._taskContext, context, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            // Subsequent turns: agent returned control, go directly to coordination (progress ledger only, no replan).
+            // Capture the participant's reply into the manager-visible chat history so the progress ledger can see it.
+            if (messages is { Count: > 0 })
+            {
+                this._taskContext.ChatHistory.AddRange(messages);
+            }
+            await this.RunCoordinationRoundAsync(this._taskContext, context, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private ChatMessage? _fullTaskLedgerMessage;
@@ -288,10 +301,11 @@ internal class MagenticOrchestrator(AIAgent managerAgent, List<AIAgent> team, Ta
 
     private async ValueTask ResetAndReplanAsync(MagenticTaskContext taskContext, IWorkflowContext context, CancellationToken cancellationToken)
     {
+        bool wasStalled = taskContext.IsStalled;
         taskContext.Reset();
         await context.SendMessageAsync(new ResetChatSignal(), cancellationToken: cancellationToken).ConfigureAwait(false);
 
-        await this.UpdatePlanAndDelegateAsync(taskContext, context, cancellationToken).ConfigureAwait(false);
+        await this.UpdatePlanAndDelegateAsync(taskContext, context, cancellationToken, replanAfterStall: wasStalled).ConfigureAwait(false);
     }
 
     private async ValueTask PrepareFinalAnswerAsync(MagenticTaskContext taskContext, IWorkflowContext context, CancellationToken cancellationToken)

@@ -289,13 +289,15 @@ class SkillScript(ABC):
         return None
 
     @abstractmethod
-    async def run(self, skill: Skill, args: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+    async def run(self, skill: Skill, args: dict[str, Any] | list[str] | None = None, **kwargs: Any) -> Any:
         """Run this script.
 
         Args:
             skill: The skill that owns this script.
-            args: Optional keyword arguments for the script, provided by the
-                agent/LLM.
+            args: Optional arguments for the script, provided by the
+                agent/LLM.  May be a ``dict`` (named keyword arguments
+                for inline scripts) or a ``list[str]`` (positional CLI
+                arguments for file-based scripts).
             **kwargs: Runtime keyword arguments forwarded only to script
                 functions that accept ``**kwargs``.
 
@@ -361,19 +363,31 @@ class InlineSkillScript(SkillScript):
             self._parameters_schema_resolved = True
         return self._parameters_schema
 
-    async def run(self, skill: Skill, args: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+    async def run(self, skill: Skill, args: dict[str, Any] | list[str] | None = None, **kwargs: Any) -> Any:
         """Run the script by invoking the callable in-process.
 
         Args:
             skill: The skill that owns this script.
             args: Optional keyword arguments for the script, provided by the
-                agent/LLM.
+                agent/LLM.  Must be a ``dict`` or ``None``; passing a
+                ``list`` raises :class:`TypeError` because inline scripts
+                bind arguments by keyword name.
             **kwargs: Runtime keyword arguments forwarded only to script
                 functions that accept ``**kwargs``.
 
         Returns:
             The script execution result.
+
+        Raises:
+            TypeError: If ``args`` is a ``list`` (array-style arguments
+                are only supported for file-based scripts).
         """
+        if isinstance(args, list):
+            raise TypeError(
+                f"Inline script '{self.name}' requires keyword arguments (dict), "
+                f"but received a list. Array-style arguments are only supported "
+                f"for file-based scripts."
+            )
         if self._accepts_kwargs:  # noqa: SIM108
             result = self.function(**(args or {}), **kwargs)
         else:
@@ -431,13 +445,23 @@ class FileSkillScript(SkillScript):
         self.full_path = full_path
         self._runner = runner
 
-    async def run(self, skill: Skill, args: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+    @property
+    def parameters_schema(self) -> dict[str, Any] | None:
+        """JSON Schema advertising that file scripts accept a string array.
+
+        Returns a fixed schema ``{"type": "array", "items": {"type": "string"}}``
+        so that the LLM knows to pass positional CLI arguments as a JSON array
+        of strings.
+        """
+        return {"type": "array", "items": {"type": "string"}}
+
+    async def run(self, skill: Skill, args: dict[str, Any] | list[str] | None = None, **kwargs: Any) -> Any:
         """Run the script by delegating to the configured runner.
 
         Args:
             skill: The skill that owns this script.  Must be a
                 :class:`FileSkill`.
-            args: Optional keyword arguments for the script.
+            args: Optional arguments for the script.
             **kwargs: Additional runtime keyword arguments (unused).
 
         Returns:
@@ -483,38 +507,45 @@ class Skill(ABC):
         """
         ...
 
-    @property
     @abstractmethod
-    def content(self) -> str:
-        """The full skill content.
+    async def get_content(self) -> str:
+        """Get the full skill content.
 
         For file-based skills this is the raw SKILL.md file content,
         optionally augmented with a synthesized scripts block when scripts
         are present.  For code-defined skills this is a synthesized XML
         document containing name, description, and body (instructions,
         resources, scripts).
+
+        Returns:
+            The full skill content string.
         """
         ...
 
-    @property
-    def resources(self) -> list[SkillResource]:
-        """Resources associated with this skill.
+    async def get_resource(self, name: str) -> SkillResource | None:
+        """Get a resource owned by this skill by name.
 
-        The default implementation returns an empty list.
-        Override this property in derived classes to provide skill-specific
-        resources.
+        Args:
+            name: The resource name (e.g. an identifier or a relative path
+                referenced inside the skill content).
+
+        Returns:
+            The :class:`SkillResource`, or ``None`` when no resource with the
+            given name exists.
         """
-        return []
+        return None
 
-    @property
-    def scripts(self) -> list[SkillScript]:
-        """Scripts associated with this skill.
+    async def get_script(self, name: str) -> SkillScript | None:
+        """Get a script owned by this skill by name.
 
-        The default implementation returns an empty list.
-        Override this property in derived classes to provide skill-specific
-        scripts.
+        Args:
+            name: The script name.
+
+        Returns:
+            The :class:`SkillScript`, or ``None`` when no script with the
+            given name exists.
         """
-        return []
+        return None
 
 
 @experimental(feature_id=ExperimentalFeature.SKILLS)
@@ -627,9 +658,7 @@ def _validate_compatibility(compatibility: str | None) -> None:
         ValueError: If the value exceeds the maximum allowed length.
     """
     if compatibility is not None and len(compatibility) > MAX_COMPATIBILITY_LENGTH:
-        raise ValueError(
-            f"Skill compatibility must be {MAX_COMPATIBILITY_LENGTH} characters or fewer."
-        )
+        raise ValueError(f"Skill compatibility must be {MAX_COMPATIBILITY_LENGTH} characters or fewer.")
 
 
 def _build_skill_content(
@@ -709,6 +738,7 @@ class InlineSkill(Skill):
                 instructions="Use this skill for DB tasks.",
             )
 
+
             @skill.resource
             def get_schema() -> str:
                 return "CREATE TABLE ..."
@@ -744,12 +774,14 @@ class InlineSkill(Skill):
         """The L1 discovery metadata for this skill."""
         return self._frontmatter
 
-    @property
-    def content(self) -> str:
+    async def get_content(self) -> str:
         """Synthesized XML content with name, description, instructions, resources, and scripts.
 
         The result is cached after the first access.  Adding resources or
         scripts after the first access will not be reflected.
+
+        Returns:
+            The synthesized XML content string.
         """
         if self._cached_content is not None:
             return self._cached_content
@@ -763,15 +795,31 @@ class InlineSkill(Skill):
         )
         return self._cached_content
 
-    @property
-    def resources(self) -> list[SkillResource]:
-        """Mutable list of :class:`SkillResource` instances."""
-        return self._resources
+    async def get_resource(self, name: str) -> SkillResource | None:
+        """Get a resource by name.
 
-    @property
-    def scripts(self) -> list[SkillScript]:
-        """Mutable list of :class:`SkillScript` instances."""
-        return self._scripts
+        Args:
+            name: The resource name to look up (case-insensitive).
+
+        Returns:
+            The :class:`SkillResource`, or ``None`` when no resource with the
+            given name exists.
+        """
+        name_lower = name.lower()
+        return next((r for r in self._resources if r.name.lower() == name_lower), None)
+
+    async def get_script(self, name: str) -> SkillScript | None:
+        """Get a script by name.
+
+        Args:
+            name: The script name to look up (case-insensitive).
+
+        Returns:
+            The :class:`SkillScript`, or ``None`` when no script with the
+            given name exists.
+        """
+        name_lower = name.lower()
+        return next((s for s in self._scripts if s.name.lower() == name_lower), None)
 
     def resource(
         self,
@@ -1295,11 +1343,13 @@ class ClassSkill(Skill, ABC):
         self._cached_scripts = scripts
         return list(self._cached_scripts)
 
-    @property
-    def content(self) -> str:
+    async def get_content(self) -> str:
         """Synthesized XML content containing name, description, instructions, resources, and scripts.
 
         The result is cached after the first access.
+
+        Returns:
+            The synthesized XML content string.
         """
         if self._cached_content is not None:
             return self._cached_content
@@ -1312,6 +1362,32 @@ class ClassSkill(Skill, ABC):
             self.scripts,
         )
         return self._cached_content
+
+    async def get_resource(self, name: str) -> SkillResource | None:
+        """Get a resource by name from the :attr:`resources` list.
+
+        Args:
+            name: The resource name to look up (case-insensitive).
+
+        Returns:
+            The :class:`SkillResource`, or ``None`` when no resource with the
+            given name exists.
+        """
+        name_lower = name.lower()
+        return next((r for r in self.resources if r.name.lower() == name_lower), None)
+
+    async def get_script(self, name: str) -> SkillScript | None:
+        """Get a script by name from the :attr:`scripts` list.
+
+        Args:
+            name: The script name to look up (case-insensitive).
+
+        Returns:
+            The :class:`SkillScript`, or ``None`` when no script with the
+            given name exists.
+        """
+        name_lower = name.lower()
+        return next((s for s in self.scripts if s.name.lower() == name_lower), None)
 
 
 @experimental(feature_id=ExperimentalFeature.SKILLS)
@@ -1348,26 +1424,60 @@ class FileSkill(Skill):
         self.path = path
         self._resources: list[SkillResource] = list(resources) if resources is not None else []
         self._scripts: list[SkillScript] = list(scripts) if scripts is not None else []
+        self._cached_content: str | None = None
 
     @property
     def frontmatter(self) -> SkillFrontmatter:
         """The L1 discovery metadata for this skill."""
         return self._frontmatter
 
-    @property
-    def content(self) -> str:
-        """The skill content provided at construction time."""
-        return self._content
+    async def get_content(self) -> str:
+        """The skill content with appended scripts block.
 
-    @property
-    def resources(self) -> list[SkillResource]:
-        """Resources discovered for this skill."""
-        return self._resources
+        When scripts are present, a ``<scripts>`` XML block is appended
+        to the raw SKILL.md content so that the LLM can discover each
+        script's ``<parameters_schema>``.
 
-    @property
-    def scripts(self) -> list[SkillScript]:
-        """Scripts discovered for this skill."""
-        return self._scripts
+        The result is cached after the first access.  Adding scripts
+        after the first access will not be reflected.
+
+        Returns:
+            The skill content string.
+        """
+        if self._cached_content is not None:
+            return self._cached_content
+        if not self._scripts:
+            self._cached_content = self._content
+        else:
+            script_lines = "\n".join(_create_script_element(s) for s in self._scripts)
+            self._cached_content = f"{self._content}\n\n<scripts>\n{script_lines}\n</scripts>"
+        return self._cached_content
+
+    async def get_resource(self, name: str) -> SkillResource | None:
+        """Get a resource by name.
+
+        Args:
+            name: The resource name to look up (case-insensitive).
+
+        Returns:
+            The :class:`SkillResource`, or ``None`` when no resource with the
+            given name exists.
+        """
+        name_lower = name.lower()
+        return next((r for r in self._resources if r.name.lower() == name_lower), None)
+
+    async def get_script(self, name: str) -> SkillScript | None:
+        """Get a script by name.
+
+        Args:
+            name: The script name to look up (case-insensitive).
+
+        Returns:
+            The :class:`SkillScript`, or ``None`` when no script with the
+            given name exists.
+        """
+        name_lower = name.lower()
+        return next((s for s in self._scripts if s.name.lower() == name_lower), None)
 
 
 # endregion
@@ -1392,7 +1502,9 @@ class SkillScriptRunner(Protocol):
     satisfies this protocol.
     """
 
-    def __call__(self, skill: FileSkill, script: FileSkillScript, args: dict[str, Any] | None = None) -> Any:
+    def __call__(
+        self, skill: FileSkill, script: FileSkillScript, args: dict[str, Any] | list[str] | None = None
+    ) -> Any:
         """Run a skill script.
 
         The :class:`SkillsProvider` resolves skill and script names
@@ -1402,7 +1514,7 @@ class SkillScriptRunner(Protocol):
         Args:
             skill: The file-based skill that owns the script.
             script: The file-based script to run.
-            args: Optional keyword arguments for the script.
+            args: Optional arguments for the script.
 
         Returns:
             The result. May be any type; the framework
@@ -1429,6 +1541,13 @@ DEFAULT_RESOURCE_EXTENSIONS: Final[tuple[str, ...]] = (
     ".txt",
 )
 DEFAULT_SCRIPT_EXTENSIONS: Final[tuple[str, ...]] = (".py",)
+
+# "." means the skill directory root itself (files directly in the skill folder).
+ROOT_DIRECTORY_INDICATOR: Final[str] = "."
+
+# Standard subdirectory names per https://agentskills.io/specification#directory-structure
+DEFAULT_RESOURCE_DIRECTORIES: Final[tuple[str, ...]] = ("references", "assets")
+DEFAULT_SCRIPT_DIRECTORIES: Final[tuple[str, ...]] = ("scripts",)
 
 # region Patterns and prompt template
 
@@ -1463,6 +1582,97 @@ YAML_INDENTED_KV_RE = re.compile(
 # Validates skill names: lowercase letters, numbers, hyphens only;
 # must not start or end with a hyphen, and must not contain consecutive hyphens.
 VALID_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9]*-[a-z0-9])*[a-z0-9]*$")
+
+# Block scalar indicator characters recognised by the lightweight YAML parser.
+_BLOCK_SCALAR_INDICATORS = ("|", ">")
+
+
+def _parse_yaml_scalar_value(yaml_content: str, kv_match: re.Match[str]) -> str:
+    """Resolve the scalar value for an unquoted YAML key-value match.
+
+    If the captured value starts with a YAML block scalar indicator (``|`` or
+    ``>``), the function reads subsequent indented continuation lines, strips
+    the common leading indentation, and joins them according to the scalar
+    style (literal preserves newlines, folded replaces them with spaces).
+
+    Chomping indicators are respected per YAML 1.2 §8.1.1.2:
+
+    * ``-`` (strip) — final line break and trailing empty lines excluded
+    * ``+`` (keep) — final line break and any trailing empty lines preserved
+    * default (clip) — final line break preserved, trailing empty lines excluded
+
+    For plain (non-block-scalar) values the captured text is returned as-is.
+    Note: explicit indentation indicators (e.g. ``|2``) are not supported;
+    indentation is auto-detected from the common leading whitespace.
+    """
+    value: str = kv_match.group(3)
+
+    if not value or value[0] not in _BLOCK_SCALAR_INDICATORS:
+        return value
+
+    scalar_style = value[0]
+    keep_trailing_newline = len(value) > 1 and value[1] == "+"
+    strip_trailing_newline = len(value) > 1 and value[1] == "-"
+
+    # Find the start of the next line after this key-value match.
+    next_line_start = yaml_content.find("\n", kv_match.end())
+    if next_line_start < 0:
+        return value
+    next_line_start += 1  # skip the newline character itself
+
+    # Collect indented continuation lines (or blank lines within the block).
+    block_lines: list[str] = []
+    pos = next_line_start
+    while pos < len(yaml_content):
+        line_end = yaml_content.find("\n", pos)
+        if line_end < 0:
+            line = yaml_content[pos:]
+            line_end = len(yaml_content)
+        else:
+            line = yaml_content[pos:line_end]
+
+        if not line or line.isspace():
+            # Blank / whitespace-only lines are part of the block.
+            block_lines.append("")
+            pos = line_end + 1 if line_end < len(yaml_content) else line_end
+            continue
+
+        if line[0] not in (" ", "\t"):
+            # Non-indented, non-blank line — end of the block.
+            break
+
+        block_lines.append(line)
+        pos = line_end + 1 if line_end < len(yaml_content) else line_end
+
+    # Strip trailing blank lines collected from the block.
+    while block_lines and block_lines[-1] == "":
+        block_lines.pop()
+
+    if not block_lines:
+        return ""
+
+    # Determine the common leading indentation across non-empty lines.
+    # Only space/tab characters count as indentation (matches YAML semantics).
+    def _indent_width(s: str) -> int:
+        i = 0
+        while i < len(s) and s[i] in (" ", "\t"):
+            i += 1
+        return i
+
+    common_indent = min(_indent_width(line) for line in block_lines if line)
+    normalized = [line[common_indent:] if line else "" for line in block_lines]
+
+    # Literal preserves newlines; folded joins non-empty lines with spaces.
+    parsed = "\n".join(normalized) if scalar_style == "|" else " ".join(line for line in normalized if line)
+
+    if keep_trailing_newline:
+        return parsed + "\n"
+    if strip_trailing_newline:
+        return parsed
+    # Clip (default): literal gets a trailing newline, folded does not.
+    if scalar_style == "|":
+        return parsed + "\n"
+    return parsed
 
 
 # Default system prompt template for advertising available skills to the model.
@@ -1595,13 +1805,13 @@ class SkillsProvider(ContextProvider):
         Keyword Args:
             instruction_template: Custom system-prompt template for
                 advertising skills. Must contain a ``{skills}`` placeholder for the
-                generated skills list. If the provider includes file-based script
-                execution instructions, the template must also contain
-                ``{runner_instructions}``. If the provider includes resource-reading
-                instructions, the template must also contain
-                ``{resource_instructions}``. Omitting any placeholder required by
-                the resolved skills configuration can raise :class:`ValueError` at
-                runtime. Uses a built-in template when ``None``.
+                generated skills list. May optionally contain
+                ``{runner_instructions}`` and/or ``{resource_instructions}``
+                placeholders; when present, they are filled with built-in
+                guidance for script execution and resource reading respectively.
+                When omitted, those instructions are simply not included in the
+                rendered prompt (the corresponding tools are still registered).
+                Uses a built-in template when ``None``.
             require_script_approval: When ``True``, skill script execution
                 requires explicit user approval before running. Instead of
                 executing immediately, the agent pauses and returns a
@@ -1650,6 +1860,8 @@ class SkillsProvider(ContextProvider):
         script_runner: SkillScriptRunner | None = None,
         resource_extensions: tuple[str, ...] | None = None,
         script_extensions: tuple[str, ...] | None = None,
+        resource_directories: Sequence[str] | None = None,
+        script_directories: Sequence[str] | None = None,
         instruction_template: str | None = None,
         require_script_approval: bool = False,
         disable_caching: bool = False,
@@ -1672,6 +1884,15 @@ class SkillsProvider(ContextProvider):
                 ``(".md", ".json", ".yaml", ".yml", ".csv", ".xml", ".txt")``.
             script_extensions: File extensions recognized as discoverable
                 scripts.  Defaults to ``(".py",)``.
+            resource_directories: Relative directory paths to scan for
+                resource files within each skill directory.  Use ``"."``
+                to include files at the skill root level.  Defaults to
+                ``("references", "assets")`` per the agentskills.io
+                specification.
+            script_directories: Relative directory paths to scan for
+                script files within each skill directory.  Use ``"."``
+                to include files at the skill root level.  Defaults to
+                ``("scripts",)`` per the agentskills.io specification.
             instruction_template: Custom system-prompt template for
                 advertising skills.  Must contain a ``{skills}`` placeholder.
                 Uses a built-in template when ``None``.
@@ -1701,6 +1922,8 @@ class SkillsProvider(ContextProvider):
                 script_runner=script_runner,
                 resource_extensions=resource_extensions,
                 script_extensions=script_extensions,
+                resource_directories=resource_directories,
+                script_directories=script_directories,
             )
         )
         return cls(
@@ -1715,29 +1938,20 @@ class SkillsProvider(ContextProvider):
     def _create_instructions(
         prompt_template: str | None,
         skills: Sequence[Skill],
-        include_script_runner_instructions: bool = False,
-        include_resource_instructions: bool = False,
     ) -> str | None:
         """Create the system-prompt text that advertises available skills.
 
         Generates an XML list of ``<skill>`` elements (sorted by name) and
         inserts it into *prompt_template* at the ``{skills}`` placeholder.
-        When *include_script_runner_instructions* is ``True``, executor-provided
-        instructions are inserted at the ``{runner_instructions}`` placeholder.
-        When *include_resource_instructions* is ``True``, resource-reading
-        instructions are inserted at the ``{resource_instructions}`` placeholder.
+        Script-runner instructions are inserted at the
+        ``{runner_instructions}`` placeholder and resource-reading
+        instructions at the ``{resource_instructions}`` placeholder.
 
         Args:
             prompt_template: Custom template string with ``{skills}`` and
                 optional ``{runner_instructions}`` and ``{resource_instructions}``
                 placeholders, or ``None`` to use the built-in default.
             skills: Registered skills.
-            include_script_runner_instructions: When ``True``, include
-                script-runner instructions in the generated prompt.
-                Defaults to ``False``.
-            include_resource_instructions: When ``True``, include
-                resource-reading instructions in the generated prompt.
-                Defaults to ``False``.
 
         Returns:
             The formatted instruction string, or ``None`` when *skills* is empty.
@@ -1746,8 +1960,8 @@ class SkillsProvider(ContextProvider):
             ValueError: If *prompt_template* is not a valid format string
                 (e.g. missing ``{skills}`` placeholder).
         """
-        runner_instructions = SCRIPT_RUNNER_INSTRUCTIONS if include_script_runner_instructions else None
-        resource_instructions = RESOURCE_INSTRUCTIONS if include_resource_instructions else None
+        runner_instructions = SCRIPT_RUNNER_INSTRUCTIONS
+        resource_instructions = RESOURCE_INSTRUCTIONS
         template = DEFAULT_SKILLS_INSTRUCTION_PROMPT
 
         if prompt_template is not None:
@@ -1768,16 +1982,6 @@ class SkillsProvider(ContextProvider):
             if "__PROBE__" not in result:
                 raise ValueError(
                     "The provided instruction_template must contain a '{skills}' placeholder."  # noqa: RUF027
-                )
-            if runner_instructions and "__EXEC_PROBE__" not in result:
-                raise ValueError(
-                    "The provided instruction_template must contain an '{runner_instructions}' placeholder "  # noqa: RUF027
-                    "when a script runner is configured."
-                )
-            if resource_instructions and "__RES_PROBE__" not in result:
-                raise ValueError(
-                    "The provided instruction_template must contain a '{resource_instructions}' placeholder "  # noqa: RUF027
-                    "when skills have resources."
                 )
             template = prompt_template
 
@@ -1812,20 +2016,13 @@ class SkillsProvider(ContextProvider):
         if not skills:
             return skills, None, []
 
-        has_scripts = any(s.scripts for s in skills)
-        has_resources = any(s.resources for s in skills)
-
         instructions = self._create_instructions(
             prompt_template=self._instruction_template,
             skills=skills,
-            include_script_runner_instructions=has_scripts,
-            include_resource_instructions=has_resources,
         )
 
         tools = self._create_tools(
             skills=skills,
-            include_script_runner_tool=has_scripts,
-            include_resource_tool=has_resources,
             require_script_approval=self._require_script_approval,
         )
 
@@ -1894,23 +2091,15 @@ class SkillsProvider(ContextProvider):
     def _create_tools(
         self,
         skills: Sequence[Skill],
-        include_script_runner_tool: bool,
-        include_resource_tool: bool,
         require_script_approval: bool = False,
     ) -> list[FunctionTool]:
         """Create the tool definitions for skill interaction.
 
-        Always includes ``load_skill``. Conditionally includes
-        ``read_skill_resource`` (when *include_resource_tool* is ``True``)
-        and ``run_skill_script`` (when *include_script_runner_tool* is
-        ``True``).
+        Always includes ``load_skill``, ``read_skill_resource``, and
+        ``run_skill_script``.
 
         Args:
             skills: The skills to bind to tool handlers.
-            include_script_runner_tool: Whether to include the
-                ``run_skill_script`` tool in the returned list.
-            include_resource_tool: Whether to include the
-                ``read_skill_resource`` tool in the returned list.
             require_script_approval: When ``True``, the
                 ``run_skill_script`` tool pauses for user approval
                 before each invocation.
@@ -1918,11 +2107,23 @@ class SkillsProvider(ContextProvider):
         Returns:
             A list of :class:`FunctionTool` instances.
         """
-        tools = [
+
+        async def _load(skill_name: str) -> str:
+            return await self._load_skill(skills, skill_name)
+
+        async def _read_resource(skill_name: str, resource_name: str, **kwargs: Any) -> Any:
+            return await self._read_skill_resource(skills, skill_name, resource_name, **kwargs)
+
+        async def _run_script(
+            skill_name: str, script_name: str, args: dict[str, Any] | list[str] | None = None, **kwargs: Any
+        ) -> Any:
+            return await self._run_skill_script(skills, skill_name, script_name, args, **kwargs)
+
+        return [
             FunctionTool(
                 name="load_skill",
                 description="Loads the full instructions for a specific skill.",
-                func=lambda skill_name: self._load_skill(skills, skill_name),  # pyright: ignore[reportUnknownArgumentType, reportUnknownLambdaType]
+                func=_load,
                 input_model={
                     "type": "object",
                     "properties": {
@@ -1931,78 +2132,74 @@ class SkillsProvider(ContextProvider):
                     "required": ["skill_name"],
                 },
             ),
+            FunctionTool(
+                name="read_skill_resource",
+                description=("Reads a resource associated with a skill, such as references, assets, or dynamic data."),
+                func=_read_resource,
+                input_model={
+                    "type": "object",
+                    "properties": {
+                        "skill_name": {"type": "string", "description": "The name of the skill."},
+                        "resource_name": {
+                            "type": "string",
+                            "description": "The name of the resource.",
+                        },
+                    },
+                    "required": ["skill_name", "resource_name"],
+                },
+            ),
+            FunctionTool(
+                name="run_skill_script",
+                description="Runs a script associated with a skill.",
+                func=_run_script,
+                approval_mode="always_require" if require_script_approval else "never_require",
+                input_model={
+                    "type": "object",
+                    "properties": {
+                        "skill_name": {"type": "string", "description": "The name of the skill."},
+                        "script_name": {
+                            "type": "string",
+                            "description": (
+                                "The name of the script to run as listed in the skill, "
+                                "preserving any directory prefix exactly as shown. "
+                                "Do not add or remove path prefixes."
+                            ),
+                        },
+                        "args": {
+                            "oneOf": [
+                                {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                    "description": (
+                                        'Named arguments as key-value pairs (e.g. {"length": 24, "uppercase": true}).'
+                                    ),
+                                },
+                                {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "Positional CLI arguments as a string array "
+                                        '(e.g. ["input.docx", "--output", "result.idx"]).'
+                                    ),
+                                },
+                                {"type": "null"},
+                            ],
+                            "default": None,
+                            "description": (
+                                "Arguments to pass to the script. "
+                                "Use an array of strings for CLI-style positional arguments "
+                                '(e.g. ["input.docx", "--output", "result.idx"]), '
+                                "or an object for named parameters "
+                                '(e.g. {"length": 24, "uppercase": true}). '
+                                "How these values are mapped to the underlying script "
+                                "is determined by the script implementation or configured runner."
+                            ),
+                        },
+                    },
+                    "required": ["skill_name", "script_name"],
+                },
+            ),
         ]
-
-        if include_resource_tool:
-
-            async def _read_resource(skill_name: str, resource_name: str, **kwargs: Any) -> Any:
-                return await self._read_skill_resource(skills, skill_name, resource_name, **kwargs)
-
-            tools.append(
-                FunctionTool(
-                    name="read_skill_resource",
-                    description=(
-                        "Reads a resource associated with a skill, such as references, assets, or dynamic data."
-                    ),
-                    func=_read_resource,
-                    input_model={
-                        "type": "object",
-                        "properties": {
-                            "skill_name": {"type": "string", "description": "The name of the skill."},
-                            "resource_name": {
-                                "type": "string",
-                                "description": "The name of the resource.",
-                            },
-                        },
-                        "required": ["skill_name", "resource_name"],
-                    },
-                )
-            )
-
-        if include_script_runner_tool:
-
-            async def _run_script(
-                skill_name: str, script_name: str, args: dict[str, Any] | None = None, **kwargs: Any
-            ) -> Any:
-                return await self._run_skill_script(skills, skill_name, script_name, args, **kwargs)
-
-            tools.append(
-                FunctionTool(
-                    name="run_skill_script",
-                    description="Runs a script associated with a skill.",
-                    func=_run_script,
-                    approval_mode="always_require" if require_script_approval else "never_require",
-                    input_model={
-                        "type": "object",
-                        "properties": {
-                            "skill_name": {"type": "string", "description": "The name of the skill."},
-                            "script_name": {
-                                "type": "string",
-                                "description": (
-                                    "The name of the script to run as listed in the skill, "
-                                    "preserving any directory prefix exactly as shown. "
-                                    "Do not add or remove path prefixes."
-                                ),
-                            },
-                            "args": {
-                                "type": ["object", "null"],
-                                "additionalProperties": True,
-                                "default": None,
-                                "description": (
-                                    "Arguments to pass to the script as key-value pairs. "
-                                    "Use parameter names as keys without leading dashes "
-                                    '(e.g. {"length": 24, "uppercase": true}). '
-                                    "How these values are mapped to the underlying script "
-                                    "is determined by the script implementation or configured runner."
-                                ),
-                            },
-                        },
-                        "required": ["skill_name", "script_name"],
-                    },
-                )
-            )
-
-        return tools
 
     @staticmethod
     def _find_skill(skills: Sequence[Skill], name: str) -> Skill | None:
@@ -2010,10 +2207,10 @@ class SkillsProvider(ContextProvider):
         name_lower = name.lower()
         return next((s for s in skills if s.frontmatter.name.lower() == name_lower), None)
 
-    def _load_skill(self, skills: Sequence[Skill], skill_name: str) -> str:
+    async def _load_skill(self, skills: Sequence[Skill], skill_name: str) -> str:
         """Return the full content for the named skill.
 
-        Delegates to the skill's :attr:`~Skill.content` property, which
+        Delegates to the skill's :meth:`~Skill.get_content` method, which
         handles format differences between file-based and code-defined skills.
 
         Args:
@@ -2033,14 +2230,14 @@ class SkillsProvider(ContextProvider):
 
         logger.info("Loading skill: %s", skill_name)
 
-        return skill.content
+        return await skill.get_content()
 
     async def _run_skill_script(
         self,
         skills: Sequence[Skill],
         skill_name: str,
         script_name: str,
-        args: dict[str, Any] | None = None,
+        args: dict[str, Any] | list[str] | None = None,
         **kwargs: Any,
     ) -> Any:
         """Run a named script from a skill.
@@ -2052,9 +2249,8 @@ class SkillsProvider(ContextProvider):
             skills: The skills to look up the skill from.
             skill_name: The name of the owning skill.
             script_name: The script name to look up (case-insensitive).
-            args: Optional keyword arguments for the script, provided by the
-                agent/LLM.  These are mapped to the function's declared
-                parameters.
+            args: Optional arguments for the script, provided by the
+                agent/LLM.
             **kwargs: Runtime keyword arguments forwarded only to script
                 functions that accept ``**kwargs`` (e.g. arguments passed via
                 ``agent.run(user_id="123")``).
@@ -2073,7 +2269,7 @@ class SkillsProvider(ContextProvider):
         if not skill:
             return f"Error: Skill '{skill_name}' not found."
 
-        script = next((s for s in skill.scripts if s.name.lower() == script_name.lower()), None)
+        script = await skill.get_script(script_name)
         if not script:
             return f"Error: Script '{script_name}' not found in skill '{skill_name}'."
 
@@ -2114,12 +2310,8 @@ class SkillsProvider(ContextProvider):
         if skill is None:
             return f"Error: Skill '{skill_name}' not found."
 
-        # Find resource by name (case-insensitive)
-        resource_name_lower = resource_name.lower()
-        for resource in skill.resources:
-            if resource.name.lower() == resource_name_lower:
-                break
-        else:
+        resource = await skill.get_resource(resource_name)
+        if resource is None:
             return f"Error: Resource '{resource_name}' not found in skill '{skill_name}'."
 
         try:
@@ -2186,7 +2378,15 @@ class FileSkillsSource(SkillsSource):
 
     Recursively scans the configured *skill_paths* directories for
     ``SKILL.md`` files (up to 2 levels deep), parses their YAML frontmatter,
-    and discovers associated resource and script files from subdirectories.
+    and discovers associated resource and script files from spec-defined
+    subdirectories.
+
+    By default, resources are discovered from ``references/`` and ``assets/``
+    subdirectories, and scripts from ``scripts/``, per the
+    `agentskills.io specification
+    <https://agentskills.io/specification>`_.  Use *resource_directories*
+    and *script_directories* to customize which subdirectories are scanned.
+    Pass ``"."`` to include files at the skill root level.
 
     Security: file-based metadata is XML-escaped before prompt injection,
     and resource reads are guarded against path traversal and symlink escape.
@@ -2200,14 +2400,15 @@ class FileSkillsSource(SkillsSource):
             source = FileSkillsSource(skill_paths="./skills")
             skills = await source.get_skills()
 
-        With a script runner and custom extensions:
+        With a script runner and custom directories:
 
         .. code-block:: python
 
             source = FileSkillsSource(
                 skill_paths=["./skills", "./more-skills"],
                 script_runner=my_runner,
-                script_extensions=(".py", ".sh"),
+                resource_directories=[".", "references", "assets"],
+                script_directories=["scripts"],
             )
     """
 
@@ -2218,12 +2419,14 @@ class FileSkillsSource(SkillsSource):
         script_runner: SkillScriptRunner | None = None,
         resource_extensions: tuple[str, ...] | None = None,
         script_extensions: tuple[str, ...] | None = None,
+        resource_directories: Sequence[str] | None = None,
+        script_directories: Sequence[str] | None = None,
     ) -> None:
         """Initialize a FileSkillsSource.
 
         Args:
             skill_paths: One or more directory paths to search for file-based
-                skills.  Each path may point to an individual skill folder
+                skills.  Each path may point to an individual skill directory
                 (containing ``SKILL.md``) or to a parent that contains skill
                 subdirectories.
 
@@ -2237,6 +2440,18 @@ class FileSkillsSource(SkillsSource):
                 ``(".md", ".json", ".yaml", ".yml", ".csv", ".xml", ".txt")``.
             script_extensions: File extensions recognized as discoverable
                 scripts.  Defaults to ``(".py",)``.
+            resource_directories: Relative directory paths to scan for
+                resource files within each skill directory.  Use ``"."``
+                to include files at the skill root level.  Defaults to
+                ``("references", "assets")`` per the
+                `agentskills.io specification
+                <https://agentskills.io/specification>`_.
+            script_directories: Relative directory paths to scan for
+                script files within each skill directory.  Use ``"."``
+                to include files at the skill root level.  Defaults to
+                ``("scripts",)`` per the
+                `agentskills.io specification
+                <https://agentskills.io/specification>`_.
         """
         if isinstance(skill_paths, (str, Path)):
             self._skill_paths: list[str] = [str(skill_paths)]
@@ -2246,6 +2461,17 @@ class FileSkillsSource(SkillsSource):
         self._script_runner = script_runner
         self._resource_extensions = resource_extensions or DEFAULT_RESOURCE_EXTENSIONS
         self._script_extensions = script_extensions or DEFAULT_SCRIPT_EXTENSIONS
+
+        self._resource_directories: tuple[str, ...] = (
+            tuple(FileSkillsSource._validate_and_normalize_directory_names(resource_directories))
+            if resource_directories is not None
+            else DEFAULT_RESOURCE_DIRECTORIES
+        )
+        self._script_directories: tuple[str, ...] = (
+            tuple(FileSkillsSource._validate_and_normalize_directory_names(script_directories))
+            if script_directories is not None
+            else DEFAULT_SCRIPT_DIRECTORIES
+        )
 
     async def get_skills(self) -> list[Skill]:
         """Discover and return all file-based skills from configured paths.
@@ -2277,23 +2503,29 @@ class FileSkillsSource(SkillsSource):
                 )
                 continue
 
+            # Discover file-based resources
+            resources: list[SkillResource] = []
+            for rn in FileSkillsSource._discover_resource_files(
+                skill_path, self._resource_extensions, self._resource_directories
+            ):
+                resource_full_path = FileSkillsSource._get_validated_resource_path(skill_path, rn)
+                resources.append(_FileSkillResource(name=rn, full_path=resource_full_path))
+
+            # Discover file-based scripts
+            scripts: list[SkillScript] = []
+            for sn in FileSkillsSource._discover_script_files(
+                skill_path, self._script_extensions, self._script_directories
+            ):
+                script_full_path = os.path.normpath(os.path.join(skill_path, sn))  # noqa: ASYNC240
+                scripts.append(FileSkillScript(name=sn, full_path=script_full_path, runner=self._script_runner))
+
             file_skill = FileSkill(
                 frontmatter=frontmatter,
                 content=content,
                 path=skill_path,
+                resources=resources,
+                scripts=scripts,
             )
-
-            # Discover and attach file-based resources
-            for rn in FileSkillsSource._discover_resource_files(skill_path, self._resource_extensions):
-                resource_full_path = FileSkillsSource._get_validated_resource_path(skill_path, rn)
-                file_skill.resources.append(_FileSkillResource(name=rn, full_path=resource_full_path))
-
-            # Discover and attach file-based scripts as SkillScript instances
-            for sn in FileSkillsSource._discover_script_files(skill_path, self._script_extensions):
-                script_full_path = os.path.normpath(os.path.join(skill_path, sn))  # noqa: ASYNC240
-                file_skill.scripts.append(
-                    FileSkillScript(name=sn, full_path=script_full_path, runner=self._script_runner)
-                )
 
             skills[file_skill.frontmatter.name] = file_skill
             logger.info("Loaded skill: %s", file_skill.frontmatter.name)
@@ -2370,115 +2602,269 @@ class FileSkillsSource(SkillsSource):
         return False
 
     @staticmethod
+    def _validate_and_normalize_directory_names(
+        directories: Sequence[str],
+    ) -> list[str]:
+        """Validate and normalize relative directory names.
+
+        Ensures each entry is a safe relative path.  The ``"."`` root indicator
+        is passed through unchanged.  Entries containing ``..`` segments or
+        representing absolute paths are rejected with a warning and skipped.
+        Empty or whitespace-only entries raise :class:`ValueError`.
+
+        Args:
+            directories: Sequence of relative directory names to validate.
+
+        Returns:
+            A list of validated, normalized directory names.
+
+        Raises:
+            ValueError: If any entry is empty or whitespace-only.
+        """
+        result: list[str] = []
+        for directory in directories:
+            if not directory or not directory.strip():
+                raise ValueError("Directory names must not be empty or whitespace.")
+
+            # Normalize separators: backslash → forward slash, strip leading ./ and trailing /
+            normalized = PurePosixPath(directory.replace("\\", "/")).as_posix()
+
+            # "." and "./" both normalize to "." — treat as root indicator
+            if normalized == ROOT_DIRECTORY_INDICATOR:
+                result.append(ROOT_DIRECTORY_INDICATOR)
+                continue
+
+            # Reject absolute paths (check both POSIX and Windows-style roots
+            # so validation is consistent regardless of the host OS)
+            if os.path.isabs(directory) or normalized.startswith("/") or re.match(r"^[A-Za-z]:[/\\]", directory):
+                logger.warning(
+                    "Skipping directory '%s': absolute paths are not allowed.",
+                    directory,
+                )
+                continue
+
+            # Reject paths containing ".." segments
+            if any(segment == ".." for segment in normalized.split("/")):
+                logger.warning(
+                    "Skipping directory '%s': parent traversal ('..') is not allowed.",
+                    directory,
+                )
+                continue
+
+            result.append(normalized)
+        return result
+
+    @staticmethod
     def _discover_resource_files(
         skill_dir_path: str,
         extensions: tuple[str, ...] = DEFAULT_RESOURCE_EXTENSIONS,
+        directories: tuple[str, ...] = DEFAULT_RESOURCE_DIRECTORIES,
     ) -> list[str]:
-        """Scan a skill directory for resource files matching *extensions*.
+        """Scan configured subdirectories for resource files matching *extensions*.
 
-        Recursively walks *skill_dir_path* and collects files whose extension
-        is in *extensions*, excluding ``SKILL.md`` itself.  Each candidate is
-        validated against path-traversal and symlink-escape checks; unsafe
-        files are skipped with a warning.
+        Scans each directory in *directories* within *skill_dir_path* for files
+        whose extension is in *extensions*, excluding ``SKILL.md`` itself.
+        Use ``"."`` in *directories* to include files at the skill root level.
+        Each candidate is validated against path-traversal and symlink-escape
+        checks; unsafe files are skipped with a warning.
 
         Args:
             skill_dir_path: Absolute path to the skill directory to scan.
             extensions: Tuple of allowed file extensions (e.g. ``(".md", ".json")``).
+            directories: Relative subdirectory paths to scan for resources.
 
         Returns:
-            Relative resource paths (forward-slash-separated) for every
+            Sorted relative resource paths (forward-slash-separated) for every
             discovered file that passes security checks.
         """
         skill_dir = Path(skill_dir_path).absolute()
         root_directory_path = str(skill_dir)
         resources: list[str] = []
         normalized_extensions = {e.lower() for e in extensions}
+        seen_directories: set[str] = set()
 
-        for resource_file in skill_dir.rglob("*"):
-            if not resource_file.is_file():
+        for directory in directories:
+            is_root = directory == ROOT_DIRECTORY_INDICATOR
+            target_dir = skill_dir if is_root else (skill_dir / directory)
+
+            # Deduplicate after resolving to avoid scanning the same directory twice.
+            # Use normcase for case-insensitive dedup on case-insensitive filesystems.
+            resolved_target = str(Path(os.path.normpath(target_dir)).absolute())
+            dedup_key = os.path.normcase(resolved_target)
+            if dedup_key in seen_directories:
+                continue
+            seen_directories.add(dedup_key)
+
+            if not target_dir.is_dir():
                 continue
 
-            if resource_file.name.upper() == SKILL_FILE_NAME.upper():
-                continue
+            # Directory-level containment and symlink checks for non-root directories
+            if not is_root:
+                if not FileSkillsSource._is_path_within_directory(resolved_target, root_directory_path):
+                    logger.warning(
+                        "Skipping resource directory '%s': resolves outside skill directory '%s'",
+                        directory,
+                        skill_dir_path,
+                    )
+                    continue
 
-            if resource_file.suffix.lower() not in normalized_extensions:
-                continue
+                if FileSkillsSource._has_symlink_in_path(resolved_target, root_directory_path):
+                    logger.warning(
+                        "Skipping resource directory '%s': symlink detected in path under skill directory '%s'",
+                        directory,
+                        skill_dir_path,
+                    )
+                    continue
 
-            resource_full_path = str(Path(os.path.normpath(resource_file)).absolute())
-
-            if not FileSkillsSource._is_path_within_directory(resource_full_path, root_directory_path):
+            # Scan top-level files only (non-recursive) within this directory
+            try:
+                entries = list(target_dir.iterdir())
+            except OSError:
                 logger.warning(
-                    "Skipping resource '%s': resolves outside skill directory '%s'",
-                    resource_file,
+                    "Failed to list resource directory '%s' in skill directory '%s'; skipping.",
+                    directory,
                     skill_dir_path,
                 )
                 continue
 
-            if FileSkillsSource._has_symlink_in_path(resource_full_path, root_directory_path):
-                logger.warning(
-                    "Skipping resource '%s': symlink detected in path under skill directory '%s'",
-                    resource_file,
-                    skill_dir_path,
-                )
-                continue
+            for resource_file in entries:
+                if not resource_file.is_file():
+                    continue
 
-            rel_path = resource_file.relative_to(skill_dir)
-            resources.append(FileSkillsSource._normalize_resource_path(str(rel_path)))
+                if resource_file.name.upper() == SKILL_FILE_NAME.upper():
+                    continue
 
+                if resource_file.suffix.lower() not in normalized_extensions:
+                    continue
+
+                resource_full_path = str(Path(os.path.normpath(resource_file)).absolute())
+
+                # Containment check: file must resolve within the target directory
+                if not FileSkillsSource._is_path_within_directory(resource_full_path, resolved_target):
+                    logger.warning(
+                        "Skipping resource '%s': resolves outside target directory '%s'",
+                        resource_file,
+                        directory,
+                    )
+                    continue
+
+                if FileSkillsSource._has_symlink_in_path(resource_full_path, root_directory_path):
+                    logger.warning(
+                        "Skipping resource '%s': symlink detected in path under skill directory '%s'",
+                        resource_file,
+                        skill_dir_path,
+                    )
+                    continue
+
+                rel_path = resource_file.relative_to(skill_dir)
+                resources.append(FileSkillsSource._normalize_resource_path(str(rel_path)))
+
+        resources.sort()
         return resources
 
     @staticmethod
     def _discover_script_files(
         skill_dir_path: str,
         extensions: tuple[str, ...] = DEFAULT_SCRIPT_EXTENSIONS,
+        directories: tuple[str, ...] = DEFAULT_SCRIPT_DIRECTORIES,
     ) -> list[str]:
-        """Scan a skill directory for script files matching *extensions*.
+        """Scan configured subdirectories for script files matching *extensions*.
 
-        Recursively walks *skill_dir_path* and collects files whose extension
-        is in *extensions*.  Each candidate is validated against path-traversal
-        and symlink-escape checks; unsafe files are skipped with a warning.
+        Scans each directory in *directories* within *skill_dir_path* for files
+        whose extension is in *extensions*.  Use ``"."`` in *directories* to
+        include files at the skill root level.  Each candidate is validated
+        against path-traversal and symlink-escape checks; unsafe files are
+        skipped with a warning.
 
         Args:
             skill_dir_path: Absolute path to the skill directory to scan.
             extensions: Tuple of allowed script extensions (e.g. ``(".py",)``).
+            directories: Relative subdirectory paths to scan for scripts.
 
         Returns:
-            Relative script paths (forward-slash-separated) for every
+            Sorted relative script paths (forward-slash-separated) for every
             discovered file that passes security checks.
         """
         skill_dir = Path(skill_dir_path).absolute()
         root_directory_path = str(skill_dir)
         scripts: list[str] = []
         normalized_extensions = {e.lower() for e in extensions}
+        seen_directories: set[str] = set()
 
-        for script_file in skill_dir.rglob("*"):
-            if not script_file.is_file():
+        for directory in directories:
+            is_root = directory == ROOT_DIRECTORY_INDICATOR
+            target_dir = skill_dir if is_root else (skill_dir / directory)
+
+            # Deduplicate after resolving to avoid scanning the same directory twice.
+            # Use normcase for case-insensitive dedup on case-insensitive filesystems.
+            resolved_target = str(Path(os.path.normpath(target_dir)).absolute())
+            dedup_key = os.path.normcase(resolved_target)
+            if dedup_key in seen_directories:
+                continue
+            seen_directories.add(dedup_key)
+
+            if not target_dir.is_dir():
                 continue
 
-            if script_file.suffix.lower() not in normalized_extensions:
-                continue
+            # Directory-level containment and symlink checks for non-root directories
+            if not is_root:
+                if not FileSkillsSource._is_path_within_directory(resolved_target, root_directory_path):
+                    logger.warning(
+                        "Skipping script directory '%s': resolves outside skill directory '%s'",
+                        directory,
+                        skill_dir_path,
+                    )
+                    continue
 
-            script_full_path = str(Path(os.path.normpath(script_file)).absolute())
+                if FileSkillsSource._has_symlink_in_path(resolved_target, root_directory_path):
+                    logger.warning(
+                        "Skipping script directory '%s': symlink detected in path under skill directory '%s'",
+                        directory,
+                        skill_dir_path,
+                    )
+                    continue
 
-            if not FileSkillsSource._is_path_within_directory(script_full_path, root_directory_path):
+            # Scan top-level files only (non-recursive) within this directory
+            try:
+                entries = list(target_dir.iterdir())
+            except OSError:
                 logger.warning(
-                    "Skipping script '%s': resolves outside skill directory '%s'",
-                    script_file,
+                    "Failed to list script directory '%s' in skill directory '%s'; skipping.",
+                    directory,
                     skill_dir_path,
                 )
                 continue
 
-            if FileSkillsSource._has_symlink_in_path(script_full_path, root_directory_path):
-                logger.warning(
-                    "Skipping script '%s': symlink detected in path under skill directory '%s'",
-                    script_file,
-                    skill_dir_path,
-                )
-                continue
+            for script_file in entries:
+                if not script_file.is_file():
+                    continue
 
-            rel_path = script_file.relative_to(skill_dir)
-            scripts.append(FileSkillsSource._normalize_resource_path(str(rel_path)))
+                if script_file.suffix.lower() not in normalized_extensions:
+                    continue
 
+                script_full_path = str(Path(os.path.normpath(script_file)).absolute())
+
+                # Containment check: file must resolve within the target directory
+                if not FileSkillsSource._is_path_within_directory(script_full_path, resolved_target):
+                    logger.warning(
+                        "Skipping script '%s': resolves outside target directory '%s'",
+                        script_file,
+                        directory,
+                    )
+                    continue
+
+                if FileSkillsSource._has_symlink_in_path(script_full_path, root_directory_path):
+                    logger.warning(
+                        "Skipping script '%s': symlink detected in path under skill directory '%s'",
+                        script_file,
+                        skill_dir_path,
+                    )
+                    continue
+
+                rel_path = script_file.relative_to(skill_dir)
+                scripts.append(FileSkillsSource._normalize_resource_path(str(rel_path)))
+
+        scripts.sort()
         return scripts
 
     @staticmethod
@@ -2603,7 +2989,9 @@ class FileSkillsSource(SkillsSource):
 
         for kv_match in YAML_KV_RE.finditer(yaml_content):
             key = kv_match.group(1)
-            value = kv_match.group(2) if kv_match.group(2) is not None else kv_match.group(3)
+            value = (
+                kv_match.group(2) if kv_match.group(2) is not None else _parse_yaml_scalar_value(yaml_content, kv_match)
+            )
 
             key_lower = key.lower()
             if key_lower == "name":

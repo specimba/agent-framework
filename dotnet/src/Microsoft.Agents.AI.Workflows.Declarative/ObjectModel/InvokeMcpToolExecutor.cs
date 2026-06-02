@@ -75,17 +75,13 @@ internal sealed class InvokeMcpToolExecutor(
 
         if (requireApproval)
         {
-            // Create tool call content for approval request
+            // Create tool call content for approval request.
+            // Transport headers (e.g. Authorization) are intentionally excluded from the
+            // approval event: they must not cross into the externally-surfaced approval request.
             McpServerToolCallContent toolCall = new(this.Id, toolName, serverLabel ?? serverUrl)
             {
                 Arguments = arguments
             };
-
-            if (headers != null)
-            {
-                toolCall.AdditionalProperties ??= [];
-                toolCall.AdditionalProperties.Add(headers);
-            }
 
             ToolApprovalRequestContent approvalRequest = new(this.Id, toolCall);
 
@@ -311,12 +307,16 @@ internal sealed class InvokeMcpToolExecutor(
 
     private bool GetAutoSendValue()
     {
-        if (this.Model.Output?.AutoSend is null)
+        // InvokeToolOutput.AutoSend is never null — it returns a literal-false default
+        // when the YAML omits the field. Use AutoSendIsDefaultValue to distinguish an
+        // explicit autoSend value from the implicit default, and treat the implicit
+        // default as autoSend = true (the historical behavior).
+        if (this.Model.Output is { AutoSendIsDefaultValue: false } output)
         {
-            return true;
+            return this.Evaluator.GetValue(output.AutoSend).Value;
         }
 
-        return this.Evaluator.GetValue(this.Model.Output.AutoSend).Value;
+        return true;
     }
 
     private string? GetConnectionName()

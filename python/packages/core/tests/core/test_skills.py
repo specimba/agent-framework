@@ -31,8 +31,11 @@ from agent_framework import (
     SkillsProvider,
 )
 from agent_framework._skills import (
+    DEFAULT_RESOURCE_DIRECTORIES,
     DEFAULT_RESOURCE_EXTENSIONS,
+    DEFAULT_SCRIPT_DIRECTORIES,
     DEFAULT_SCRIPT_EXTENSIONS,
+    ROOT_DIRECTORY_INDICATOR,
     InlineSkillResource,
     InlineSkillScript,
     _create_resource_element,
@@ -143,6 +146,8 @@ async def _discover_file_skills_for_test(
     *,
     resource_extensions: tuple[str, ...] | None = None,
     script_extensions: tuple[str, ...] | None = None,
+    resource_directories: Sequence[str] | None = None,
+    script_directories: Sequence[str] | None = None,
     script_runner: Any = None,
 ) -> dict[str, FileSkill]:
     """Test helper: discover file skills and return as a dict keyed by name.
@@ -155,6 +160,10 @@ async def _discover_file_skills_for_test(
         kwargs["resource_extensions"] = resource_extensions
     if script_extensions is not None:
         kwargs["script_extensions"] = script_extensions
+    if resource_directories is not None:
+        kwargs["resource_directories"] = resource_directories
+    if script_directories is not None:
+        kwargs["script_directories"] = script_directories
     if script_runner is not None:
         kwargs["script_runner"] = script_runner
 
@@ -191,59 +200,103 @@ class TestNormalizeResourcePath:
 class TestDiscoverResourceFiles:
     """Tests for _discover_resource_files (filesystem-based resource discovery)."""
 
-    def test_discovers_md_files(self, tmp_path: Path) -> None:
+    def test_discovers_md_files_in_references(self, tmp_path: Path) -> None:
         skill_dir = tmp_path / "my-skill"
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text("---\nname: s\ndescription: d\n---\n", encoding="utf-8")
-        refs = skill_dir / "refs"
+        refs = skill_dir / "references"
         refs.mkdir()
         (refs / "FAQ.md").write_text("FAQ content", encoding="utf-8")
         resources = FileSkillsSource._discover_resource_files(str(skill_dir))
-        assert "refs/FAQ.md" in resources
+        assert "references/FAQ.md" in resources
 
-    def test_excludes_skill_md(self, tmp_path: Path) -> None:
+    def test_discovers_md_files_in_assets(self, tmp_path: Path) -> None:
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        assets = skill_dir / "assets"
+        assets.mkdir()
+        (assets / "guide.md").write_text("guide", encoding="utf-8")
+        resources = FileSkillsSource._discover_resource_files(str(skill_dir))
+        assert "assets/guide.md" in resources
+
+    def test_excludes_skill_md_at_root(self, tmp_path: Path) -> None:
         skill_dir = tmp_path / "my-skill"
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text("content", encoding="utf-8")
-        resources = FileSkillsSource._discover_resource_files(str(skill_dir))
+        resources = FileSkillsSource._discover_resource_files(str(skill_dir), directories=(".",))
         assert len(resources) == 0
 
     def test_discovers_multiple_extensions(self, tmp_path: Path) -> None:
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
-        (skill_dir / "data.json").write_text("{}", encoding="utf-8")
-        (skill_dir / "config.yaml").write_text("key: val", encoding="utf-8")
-        (skill_dir / "notes.txt").write_text("notes", encoding="utf-8")
+        refs = skill_dir / "references"
+        refs.mkdir(parents=True)
+        (refs / "data.json").write_text("{}", encoding="utf-8")
+        (refs / "config.yaml").write_text("key: val", encoding="utf-8")
+        (refs / "notes.txt").write_text("notes", encoding="utf-8")
         resources = FileSkillsSource._discover_resource_files(str(skill_dir))
         assert len(resources) == 3
         names = set(resources)
-        assert "data.json" in names
-        assert "config.yaml" in names
-        assert "notes.txt" in names
+        assert "references/data.json" in names
+        assert "references/config.yaml" in names
+        assert "references/notes.txt" in names
 
     def test_ignores_unsupported_extensions(self, tmp_path: Path) -> None:
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
-        (skill_dir / "image.png").write_bytes(b"\x89PNG")
-        (skill_dir / "binary.exe").write_bytes(b"\x00")
+        refs = skill_dir / "references"
+        refs.mkdir(parents=True)
+        (refs / "image.png").write_bytes(b"\x89PNG")
+        (refs / "binary.exe").write_bytes(b"\x00")
         resources = FileSkillsSource._discover_resource_files(str(skill_dir))
         assert len(resources) == 0
 
     def test_custom_extensions(self, tmp_path: Path) -> None:
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
-        (skill_dir / "data.json").write_text("{}", encoding="utf-8")
-        (skill_dir / "notes.txt").write_text("notes", encoding="utf-8")
+        refs = skill_dir / "references"
+        refs.mkdir(parents=True)
+        (refs / "data.json").write_text("{}", encoding="utf-8")
+        (refs / "notes.txt").write_text("notes", encoding="utf-8")
         resources = FileSkillsSource._discover_resource_files(str(skill_dir), extensions=(".json",))
-        assert resources == ["data.json"]
+        assert resources == ["references/data.json"]
 
-    def test_discovers_nested_files(self, tmp_path: Path) -> None:
+    def test_does_not_discover_nested_files(self, tmp_path: Path) -> None:
+        """Non-recursive: files inside subdirectories of configured dirs are not discovered."""
         skill_dir = tmp_path / "my-skill"
-        sub = skill_dir / "refs" / "deep"
+        sub = skill_dir / "references" / "deep"
         sub.mkdir(parents=True)
         (sub / "doc.md").write_text("deep doc", encoding="utf-8")
         resources = FileSkillsSource._discover_resource_files(str(skill_dir))
-        assert "refs/deep/doc.md" in resources
+        assert len(resources) == 0
+
+    def test_root_directory_discovers_root_files(self, tmp_path: Path) -> None:
+        """The '.' root indicator discovers files at the skill root level."""
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "data.json").write_text("{}", encoding="utf-8")
+        resources = FileSkillsSource._discover_resource_files(str(skill_dir), directories=(".",))
+        assert "data.json" in resources
+
+    def test_root_does_not_discover_by_default(self, tmp_path: Path) -> None:
+        """Files at skill root are not discovered with default directories."""
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "data.json").write_text("{}", encoding="utf-8")
+        resources = FileSkillsSource._discover_resource_files(str(skill_dir))
+        assert len(resources) == 0
+
+    def test_custom_directories(self, tmp_path: Path) -> None:
+        """Custom directory names override defaults."""
+        skill_dir = tmp_path / "my-skill"
+        custom = skill_dir / "docs"
+        custom.mkdir(parents=True)
+        (custom / "readme.md").write_text("readme", encoding="utf-8")
+        resources = FileSkillsSource._discover_resource_files(str(skill_dir), directories=("docs",))
+        assert "docs/readme.md" in resources
+
+    def test_nonexistent_directory_silently_skipped(self, tmp_path: Path) -> None:
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        resources = FileSkillsSource._discover_resource_files(str(skill_dir), directories=("nonexistent",))
+        assert resources == []
 
     def test_empty_directory(self, tmp_path: Path) -> None:
         skill_dir = tmp_path / "my-skill"
@@ -259,6 +312,25 @@ class TestDiscoverResourceFiles:
         assert ".csv" in DEFAULT_RESOURCE_EXTENSIONS
         assert ".xml" in DEFAULT_RESOURCE_EXTENSIONS
         assert ".txt" in DEFAULT_RESOURCE_EXTENSIONS
+
+    def test_duplicate_directories_deduplicated(self, tmp_path: Path) -> None:
+        """Duplicate directory entries should not produce duplicate resources."""
+        skill_dir = tmp_path / "my-skill"
+        refs = skill_dir / "references"
+        refs.mkdir(parents=True)
+        (refs / "doc.md").write_text("content", encoding="utf-8")
+        resources = FileSkillsSource._discover_resource_files(str(skill_dir), directories=("references", "references"))
+        assert resources == ["references/doc.md"]
+
+    def test_results_are_sorted(self, tmp_path: Path) -> None:
+        """Results should be sorted for stable ordering."""
+        skill_dir = tmp_path / "my-skill"
+        refs = skill_dir / "references"
+        refs.mkdir(parents=True)
+        (refs / "zebra.md").write_text("z", encoding="utf-8")
+        (refs / "alpha.md").write_text("a", encoding="utf-8")
+        resources = FileSkillsSource._discover_resource_files(str(skill_dir))
+        assert resources == ["references/alpha.md", "references/zebra.md"]
 
 
 class TestTryParseSkillDocument:
@@ -379,7 +451,7 @@ class TestDiscoverAndLoadSkills:
         _write_skill(dir2, "my-skill", body="Second")
         skills = await _discover_file_skills_for_test([str(dir1), str(dir2)])
         assert len(skills) == 1
-        assert "First" in skills["my-skill"].content
+        assert "First" in (await skills["my-skill"].get_content())
 
     async def test_empty_directory(self, tmp_path: Path) -> None:
         skills = await _discover_file_skills_for_test([str(tmp_path)])
@@ -413,11 +485,11 @@ class TestDiscoverAndLoadSkills:
             tmp_path,
             "my-skill",
             body="Instructions here.",
-            resources={"refs/FAQ.md": "FAQ content"},
+            resources={"references/FAQ.md": "FAQ content"},
         )
         skills = await _discover_file_skills_for_test([str(tmp_path)])
         assert "my-skill" in skills
-        assert [r.name for r in skills["my-skill"].resources] == ["refs/FAQ.md"]
+        assert [r.name for r in skills["my-skill"]._resources] == ["references/FAQ.md"]
 
     async def test_skill_discovers_all_resource_files(self, tmp_path: Path) -> None:
         """Resources are discovered by filesystem scan, not by markdown links."""
@@ -425,13 +497,13 @@ class TestDiscoverAndLoadSkills:
             tmp_path,
             "my-skill",
             body="No links here.",
-            resources={"data.json": '{"key": "val"}', "refs/doc.md": "doc content"},
+            resources={"references/data.json": '{"key": "val"}', "assets/doc.md": "doc content"},
         )
         skills = await _discover_file_skills_for_test([str(tmp_path)])
         assert "my-skill" in skills
-        resource_names = sorted(r.name for r in skills["my-skill"].resources)
-        assert "data.json" in resource_names
-        assert "refs/doc.md" in resource_names
+        resource_names = sorted(r.name for r in skills["my-skill"]._resources)
+        assert "assets/doc.md" in resource_names
+        assert "references/data.json" in resource_names
 
 
 # ---------------------------------------------------------------------------
@@ -446,12 +518,12 @@ class TestReadSkillResource:
         _write_skill(
             tmp_path,
             "my-skill",
-            body="See [doc](refs/FAQ.md).",
-            resources={"refs/FAQ.md": "FAQ content here"},
+            body="See [doc](references/FAQ.md).",
+            resources={"references/FAQ.md": "FAQ content here"},
         )
         skill_dir = tmp_path / "my-skill"
-        full_path = str(skill_dir / "refs" / "FAQ.md")
-        resource = _FileSkillResource(name="refs/FAQ.md", full_path=full_path)
+        full_path = str(skill_dir / "references" / "FAQ.md")
+        resource = _FileSkillResource(name="references/FAQ.md", full_path=full_path)
         content = await resource.read()
         assert content == "FAQ content here"
 
@@ -468,12 +540,12 @@ class TestReadSkillResource:
         _write_skill(
             tmp_path,
             "my-skill",
-            body="See [doc](refs/FAQ.md).",
-            resources={"refs/FAQ.md": "FAQ content"},
+            body="See [doc](references/FAQ.md).",
+            resources={"references/FAQ.md": "FAQ content"},
         )
         skill_dir = tmp_path / "my-skill"
-        full_path = str(skill_dir / "refs" / "FAQ.md")
-        resource = _FileSkillResource(name="refs/FAQ.md", full_path=full_path)
+        full_path = str(skill_dir / "references" / "FAQ.md")
+        resource = _FileSkillResource(name="references/FAQ.md", full_path=full_path)
         content = await resource.read()
         assert content == "FAQ content"
 
@@ -486,7 +558,7 @@ class TestReadSkillResource:
         skill_dir = tmp_path / "skill"
         skill_dir.mkdir()
         (tmp_path / "secret.md").write_text("secret", encoding="utf-8")
-        resources = FileSkillsSource._discover_resource_files(str(skill_dir))
+        resources = FileSkillsSource._discover_resource_files(str(skill_dir), directories=(".",))
         assert not any("secret" in r for r in resources)
 
 
@@ -604,9 +676,9 @@ class TestSkillsProvider:
 
         assert len(context.instructions) == 1
         assert "my-skill" in context.instructions[0]
-        assert len(context.tools) == 1
         tool_names = {t.name for t in context.tools}
-        assert tool_names == {"load_skill"}
+        assert len(context.tools) == 3
+        assert tool_names == {"load_skill", "read_skill_resource", "run_skill_script"}
 
     async def test_before_run_without_skills(self, tmp_path: Path) -> None:
         provider = SkillsProvider.from_paths(str(tmp_path))
@@ -626,43 +698,43 @@ class TestSkillsProvider:
         _write_skill(tmp_path, "my-skill", body="Skill body content.")
         provider = SkillsProvider.from_paths(str(tmp_path))
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "my-skill")
+        result = await provider._load_skill(_raw_skills(provider), "my-skill")
         assert "Skill body content." in result
 
     async def test_load_skill_preserves_file_skill_content(self, tmp_path: Path) -> None:
         _write_skill(
             tmp_path,
             "my-skill",
-            body="See [doc](refs/FAQ.md).",
-            resources={"refs/FAQ.md": "FAQ content"},
+            body="See [doc](references/FAQ.md).",
+            resources={"references/FAQ.md": "FAQ content"},
         )
         provider = SkillsProvider.from_paths(str(tmp_path))
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "my-skill")
-        assert "See [doc](refs/FAQ.md)." in result
+        result = await provider._load_skill(_raw_skills(provider), "my-skill")
+        assert "See [doc](references/FAQ.md)." in result
 
     async def test_load_skill_unknown_returns_error(self, tmp_path: Path) -> None:
         provider = SkillsProvider.from_paths(str(tmp_path))
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "nonexistent")
+        result = await provider._load_skill(_raw_skills(provider), "nonexistent")
         assert result.startswith("Error:")
 
     async def test_load_skill_empty_name_returns_error(self, tmp_path: Path) -> None:
         provider = SkillsProvider.from_paths(str(tmp_path))
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "")
+        result = await provider._load_skill(_raw_skills(provider), "")
         assert result.startswith("Error:")
 
     async def test_read_skill_resource_returns_content(self, tmp_path: Path) -> None:
         _write_skill(
             tmp_path,
             "my-skill",
-            body="See [doc](refs/FAQ.md).",
-            resources={"refs/FAQ.md": "FAQ content"},
+            body="See [doc](references/FAQ.md).",
+            resources={"references/FAQ.md": "FAQ content"},
         )
         provider = SkillsProvider.from_paths(str(tmp_path))
         await _init_provider(provider)
-        result = await provider._read_skill_resource(_raw_skills(provider), "my-skill", "refs/FAQ.md")
+        result = await provider._read_skill_resource(_raw_skills(provider), "my-skill", "references/FAQ.md")
         assert result == "FAQ content"
 
     async def test_read_skill_resource_unknown_skill_returns_error(self, tmp_path: Path) -> None:
@@ -791,7 +863,7 @@ class TestSymlinkDetection:
             "---\nname: my-skill\ndescription: A test skill.\n---\nInstructions.\n",
             encoding="utf-8",
         )
-        refs_dir = skill_dir / "refs"
+        refs_dir = skill_dir / "references"
         refs_dir.mkdir()
         (refs_dir / "leak.md").symlink_to(outside_file)
         # Also add a safe resource
@@ -799,9 +871,9 @@ class TestSymlinkDetection:
 
         skills = await _discover_file_skills_for_test([str(tmp_path)])
         assert "my-skill" in skills
-        resource_names = [r.name for r in skills["my-skill"].resources]
-        assert "refs/leak.md" not in resource_names
-        assert "refs/safe.md" in resource_names
+        resource_names = [r.name for r in skills["my-skill"]._resources]
+        assert "references/leak.md" not in resource_names
+        assert "references/safe.md" in resource_names
 
     def test_discover_resource_files_rejects_symlinked_resource(self, tmp_path: Path) -> None:
         """_discover_resource_files should exclude a symlinked resource file."""
@@ -811,12 +883,12 @@ class TestSymlinkDetection:
         outside_file = tmp_path / "secret.md"
         outside_file.write_text("secret content", encoding="utf-8")
 
-        refs_dir = skill_dir / "refs"
+        refs_dir = skill_dir / "references"
         refs_dir.mkdir()
         (refs_dir / "leak.md").symlink_to(outside_file)
 
         resources = FileSkillsSource._discover_resource_files(str(skill_dir))
-        assert "refs/leak.md" not in resources
+        assert "references/leak.md" not in resources
 
     def test_discover_skips_symlinked_script(self, tmp_path: Path) -> None:
         """_discover_script_files should skip scripts with symlinks in their path."""
@@ -960,7 +1032,7 @@ class TestInlineSkill:
         assert skill.frontmatter.name == "my-skill"
         assert skill.frontmatter.description == "A test skill."
         assert skill.instructions == "Instructions."
-        assert skill.resources == []
+        assert skill._resources == []
 
     def test_construction_with_static_resources(self) -> None:
         skill = InlineSkill(
@@ -970,8 +1042,8 @@ class TestInlineSkill:
                 InlineSkillResource(name="ref", content="Reference content"),
             ],
         )
-        assert len(skill.resources) == 1
-        assert skill.resources[0].name == "ref"
+        assert len(skill._resources) == 1
+        assert skill._resources[0].name == "ref"
 
     def test_empty_name_raises(self) -> None:
         with pytest.raises(ValueError, match="cannot be empty"):
@@ -1011,11 +1083,11 @@ class TestInlineSkill:
             """Get the database schema."""
             return "CREATE TABLE users (id INT)"
 
-        assert len(skill.resources) == 1
-        assert skill.resources[0].name == "get_schema"
-        assert skill.resources[0].description is None
-        assert isinstance(skill.resources[0], InlineSkillResource)
-        assert skill.resources[0].function is get_schema
+        assert len(skill._resources) == 1
+        assert skill._resources[0].name == "get_schema"
+        assert skill._resources[0].description is None
+        assert isinstance(skill._resources[0], InlineSkillResource)
+        assert skill._resources[0].function is get_schema
 
     def test_resource_decorator_with_args(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="A skill."), instructions="Body")
@@ -1024,9 +1096,9 @@ class TestInlineSkill:
         def my_resource() -> Any:
             return "data"
 
-        assert len(skill.resources) == 1
-        assert skill.resources[0].name == "custom-name"
-        assert skill.resources[0].description == "Custom description"
+        assert len(skill._resources) == 1
+        assert skill._resources[0].name == "custom-name"
+        assert skill._resources[0].description == "Custom description"
 
     def test_resource_decorator_returns_function(self) -> None:
         """Decorator should return the original function unchanged."""
@@ -1050,8 +1122,8 @@ class TestInlineSkill:
         def resource_b() -> Any:
             return "B"
 
-        assert len(skill.resources) == 2
-        names = [r.name for r in skill.resources]
+        assert len(skill._resources) == 2
+        names = [r.name for r in skill._resources]
         assert "resource_a" in names
         assert "resource_b" in names
 
@@ -1062,9 +1134,9 @@ class TestInlineSkill:
         async def get_async_data() -> Any:
             return "async data"
 
-        assert len(skill.resources) == 1
-        assert isinstance(skill.resources[0], InlineSkillResource)
-        assert skill.resources[0].function is get_async_data
+        assert len(skill._resources) == 1
+        assert isinstance(skill._resources[0], InlineSkillResource)
+        assert skill._resources[0].function is get_async_data
 
 
 # ---------------------------------------------------------------------------
@@ -1091,7 +1163,7 @@ class TestSkillsProviderCodeSkill:
         )
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "prog-skill")
+        result = await provider._load_skill(_raw_skills(provider), "prog-skill")
         assert "<name>prog-skill</name>" in result
         assert "<description>A skill.</description>" in result
         assert "<instructions>\nCode-defined instructions.\n</instructions>" in result
@@ -1108,7 +1180,7 @@ class TestSkillsProviderCodeSkill:
         )
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "prog-skill")
+        result = await provider._load_skill(_raw_skills(provider), "prog-skill")
         assert "<name>prog-skill</name>" in result
         assert "<description>A skill.</description>" in result
         assert "Do things." in result
@@ -1122,7 +1194,7 @@ class TestSkillsProviderCodeSkill:
         )
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "prog-skill")
+        result = await provider._load_skill(_raw_skills(provider), "prog-skill")
         assert "Body only." in result
         assert "<resources>" not in result
 
@@ -1292,7 +1364,8 @@ class TestSkillsProviderCodeSkill:
 
         assert len(context.instructions) == 1
         assert "prog-skill" in context.instructions[0]
-        assert len(context.tools) == 1
+        assert len(context.tools) == 3
+        assert {t.name for t in context.tools} == {"load_skill", "read_skill_resource", "run_skill_script"}
 
     async def test_before_run_empty_provider(self) -> None:
         provider = SkillsProvider([])
@@ -1335,7 +1408,7 @@ class TestSkillsProviderCodeSkill:
         )
         await _init_provider(provider)
         # File-based is loaded first, so it wins
-        assert "File version" in _ctx(provider)[0]["my-skill"].content
+        assert "File version" in (await _ctx(provider)[0]["my-skill"].get_content())
 
     async def test_combined_prompt_includes_both(self, tmp_path: Path) -> None:
         _write_skill(tmp_path, "file-skill")
@@ -1361,21 +1434,22 @@ class TestSkillsProviderCodeSkill:
     async def test_custom_resource_extensions(self, tmp_path: Path) -> None:
         """SkillsProvider accepts custom resource_extensions."""
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        refs = skill_dir / "references"
+        refs.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: A test skill.\n---\nBody.",
             encoding="utf-8",
         )
-        (skill_dir / "data.json").write_text("{}", encoding="utf-8")
-        (skill_dir / "notes.txt").write_text("notes", encoding="utf-8")
+        (refs / "data.json").write_text("{}", encoding="utf-8")
+        (refs / "notes.txt").write_text("notes", encoding="utf-8")
 
         # Only discover .json files
         provider = SkillsProvider.from_paths(str(tmp_path), resource_extensions=(".json",))
         await _init_provider(provider)
         skill = _ctx(provider)[0]["my-skill"]
-        resource_names = [r.name for r in skill.resources]
-        assert "data.json" in resource_names
-        assert "notes.txt" not in resource_names
+        resource_names = [r.name for r in skill._resources]
+        assert "references/data.json" in resource_names
+        assert "references/notes.txt" not in resource_names
 
 
 # ---------------------------------------------------------------------------
@@ -1386,14 +1460,14 @@ class TestSkillsProviderCodeSkill:
 class TestFileBasedSkillParsing:
     """Tests for file-based skills parsed from SKILL.md."""
 
-    def test_content_contains_full_raw_file(self, tmp_path: Path) -> None:
+    async def test_content_contains_full_raw_file(self, tmp_path: Path) -> None:
         """content stores the entire SKILL.md file including frontmatter."""
         _write_skill(tmp_path, "my-skill", description="A test skill.", body="Instructions here.")
         skill = _read_and_parse_skill_file_for_test(tmp_path / "my-skill")
-        assert "---" in skill.content
-        assert "name: my-skill" in skill.content
-        assert "description: A test skill." in skill.content
-        assert "Instructions here." in skill.content
+        assert "---" in (await skill.get_content())
+        assert "name: my-skill" in (await skill.get_content())
+        assert "description: A test skill." in (await skill.get_content())
+        assert "Instructions here." in (await skill.get_content())
 
     def test_name_and_description_from_frontmatter(self, tmp_path: Path) -> None:
         _write_skill(tmp_path, "my-skill", description="Skill desc.")
@@ -1407,11 +1481,11 @@ class TestFileBasedSkillParsing:
         assert skill.path == str(tmp_path / "my-skill")
 
     async def test_resources_populated(self, tmp_path: Path) -> None:
-        _write_skill(tmp_path, "my-skill", resources={"refs/doc.md": "content"})
+        _write_skill(tmp_path, "my-skill", resources={"references/doc.md": "content"})
         skills = await _discover_file_skills_for_test([str(tmp_path)])
         assert "my-skill" in skills
-        resource_names = [r.name for r in skills["my-skill"].resources]
-        assert "refs/doc.md" in resource_names
+        resource_names = [r.name for r in skills["my-skill"]._resources]
+        assert "references/doc.md" in resource_names
 
 
 # ---------------------------------------------------------------------------
@@ -1427,7 +1501,7 @@ class TestLoadSkillFormatting:
         _write_skill(tmp_path, "my-skill", body="Do the thing.")
         provider = SkillsProvider.from_paths(str(tmp_path))
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "my-skill")
+        result = await provider._load_skill(_raw_skills(provider), "my-skill")
         assert "Do the thing." in result
         assert "<name>" not in result
         assert "<instructions>" not in result
@@ -1439,7 +1513,7 @@ class TestLoadSkillFormatting:
         )
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "prog-skill")
+        result = await provider._load_skill(_raw_skills(provider), "prog-skill")
         assert "<name>prog-skill</name>" in result
         assert "<description>A skill.</description>" in result
         assert "<instructions>\nDo stuff.\n</instructions>" in result
@@ -1453,7 +1527,7 @@ class TestLoadSkillFormatting:
         )
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "prog-skill")
+        result = await provider._load_skill(_raw_skills(provider), "prog-skill")
         assert '<resource name="data"/>' in result
         assert "description=" not in result
 
@@ -1467,12 +1541,12 @@ class TestDiscoverResourceFilesEdgeCases:
     """Additional edge-case tests for filesystem resource discovery."""
 
     def test_excludes_skill_md_case_insensitive(self, tmp_path: Path) -> None:
-        """SKILL.md in any casing is excluded."""
+        """SKILL.md in any casing is excluded when scanning root."""
         skill_dir = tmp_path / "my-skill"
         skill_dir.mkdir()
         (skill_dir / "skill.md").write_text("lowercase name", encoding="utf-8")
         (skill_dir / "other.md").write_text("keep me", encoding="utf-8")
-        resources = FileSkillsSource._discover_resource_files(str(skill_dir))
+        resources = FileSkillsSource._discover_resource_files(str(skill_dir), directories=(".",))
         names = [r.lower() for r in resources]
         assert "skill.md" not in names
         assert "other.md" in resources
@@ -1480,17 +1554,217 @@ class TestDiscoverResourceFilesEdgeCases:
     def test_skips_directories(self, tmp_path: Path) -> None:
         """Directories are not included as resources even if their name matches an extension."""
         skill_dir = tmp_path / "my-skill"
-        subdir = skill_dir / "data.json"
-        subdir.mkdir(parents=True)
+        refs = skill_dir / "references"
+        refs.mkdir(parents=True)
+        subdir = refs / "data.json"
+        subdir.mkdir()
         resources = FileSkillsSource._discover_resource_files(str(skill_dir))
         assert resources == []
 
     def test_extension_matching_is_case_insensitive(self, tmp_path: Path) -> None:
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
-        (skill_dir / "NOTES.TXT").write_text("caps", encoding="utf-8")
+        refs = skill_dir / "references"
+        refs.mkdir(parents=True)
+        (refs / "NOTES.TXT").write_text("caps", encoding="utf-8")
         resources = FileSkillsSource._discover_resource_files(str(skill_dir))
         assert len(resources) == 1
+
+
+class TestDiscoverFilesOSErrorWarning:
+    """OSError during directory listing should log a warning, not fail silently."""
+
+    def test_resource_discovery_warns_on_oserror(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """_discover_resource_files logs a warning when iterdir() raises OSError."""
+        skill_dir = tmp_path / "my-skill"
+        refs = skill_dir / "references"
+        refs.mkdir(parents=True)
+        (refs / "guide.md").write_text("content", encoding="utf-8")
+
+        original_iterdir = Path.iterdir
+
+        def _patched_iterdir(self: Path) -> Any:
+            if self.name == "references":
+                raise PermissionError("access denied")
+            return original_iterdir(self)
+
+        import unittest.mock
+
+        with unittest.mock.patch.object(Path, "iterdir", _patched_iterdir):
+            resources = FileSkillsSource._discover_resource_files(str(skill_dir))
+
+        assert resources == []
+        assert any("Failed to list resource directory" in r.message for r in caplog.records)
+
+    def test_script_discovery_warns_on_oserror(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """_discover_script_files logs a warning when iterdir() raises OSError."""
+        skill_dir = tmp_path / "my-skill"
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "run.py").write_text("print('hi')", encoding="utf-8")
+
+        original_iterdir = Path.iterdir
+
+        def _patched_iterdir(self: Path) -> Any:
+            if self.name == "scripts":
+                raise PermissionError("access denied")
+            return original_iterdir(self)
+
+        import unittest.mock
+
+        with unittest.mock.patch.object(Path, "iterdir", _patched_iterdir):
+            scripts = FileSkillsSource._discover_script_files(str(skill_dir))
+
+        assert scripts == []
+        assert any("Failed to list script directory" in r.message for r in caplog.records)
+
+
+class TestValidateAndNormalizeDirectoryNames:
+    """Tests for _validate_and_normalize_directory_names."""
+
+    def test_simple_directory_name(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names(["references"])
+        assert result == ["references"]
+
+    def test_root_indicator(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names(["."])
+        assert result == ["."]
+
+    def test_dot_slash_normalizes_to_root(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names(["./"])
+        assert result == ["."]
+
+    def test_backslash_dot_normalizes_to_root(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names([".\\"])
+        assert result == ["."]
+
+    def test_backslashes_normalized(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names(["sub\\scripts"])
+        assert result == ["sub/scripts"]
+
+    def test_trailing_slash_stripped(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names(["scripts/"])
+        assert result == ["scripts"]
+
+    def test_leading_dot_slash_stripped(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names(["./references"])
+        assert result == ["references"]
+
+    def test_rejects_parent_traversal(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names(["../secrets"])
+        assert result == []
+
+    def test_rejects_embedded_parent_traversal(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names(["sub/../secrets"])
+        assert result == []
+
+    def test_rejects_absolute_path(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names(["/etc/passwd"])
+        assert result == []
+
+    def test_rejects_windows_absolute_path(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names(["C:\\Windows"])
+        assert result == []
+
+    def test_empty_string_raises(self) -> None:
+        with pytest.raises(ValueError, match="empty or whitespace"):
+            FileSkillsSource._validate_and_normalize_directory_names([""])
+
+    def test_whitespace_only_raises(self) -> None:
+        with pytest.raises(ValueError, match="empty or whitespace"):
+            FileSkillsSource._validate_and_normalize_directory_names(["   "])
+
+    def test_multiple_directories(self) -> None:
+        result = FileSkillsSource._validate_and_normalize_directory_names([".", "references", "assets", "scripts"])
+        assert result == [".", "references", "assets", "scripts"]
+
+    def test_default_resource_directories(self) -> None:
+        assert DEFAULT_RESOURCE_DIRECTORIES == ("references", "assets")
+
+    def test_default_script_directories(self) -> None:
+        assert DEFAULT_SCRIPT_DIRECTORIES == ("scripts",)
+
+    def test_root_directory_indicator_is_dot(self) -> None:
+        assert ROOT_DIRECTORY_INDICATOR == "."
+
+
+class TestFileSkillsSourceDirectories:
+    """Tests for resource_directories and script_directories parameters."""
+
+    async def test_custom_resource_directories(self, tmp_path: Path) -> None:
+        """Custom resource_directories controls which dirs are scanned."""
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: my-skill\ndescription: test\n---\nBody",
+            encoding="utf-8",
+        )
+        # Put resource in a custom directory
+        docs = skill_dir / "docs"
+        docs.mkdir()
+        (docs / "guide.md").write_text("guide", encoding="utf-8")
+        # Also put one in default references/ — should not be found
+        refs = skill_dir / "references"
+        refs.mkdir()
+        (refs / "ref.md").write_text("ref", encoding="utf-8")
+
+        source = FileSkillsSource(str(tmp_path), resource_directories=["docs"])
+        skills = await source.get_skills()
+        resource_names = [r.name for r in skills[0]._resources]
+        assert "docs/guide.md" in resource_names
+        assert "references/ref.md" not in resource_names
+
+    async def test_custom_script_directories(self, tmp_path: Path) -> None:
+        """Custom script_directories controls which dirs are scanned."""
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: my-skill\ndescription: test\n---\nBody",
+            encoding="utf-8",
+        )
+        # Put script in a custom directory
+        tools = skill_dir / "tools"
+        tools.mkdir()
+        (tools / "run.py").write_text("print('run')", encoding="utf-8")
+
+        source = FileSkillsSource(str(tmp_path), script_directories=["tools"])
+        skills = await source.get_skills()
+        script_names = [s.name for s in skills[0]._scripts]
+        assert "tools/run.py" in script_names
+
+    async def test_root_indicator_discovers_root_files(self, tmp_path: Path) -> None:
+        """The '.' root indicator discovers files at the skill root."""
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: my-skill\ndescription: test\n---\nBody",
+            encoding="utf-8",
+        )
+        (skill_dir / "data.json").write_text("{}", encoding="utf-8")
+
+        source = FileSkillsSource(str(tmp_path), resource_directories=[".", "references"])
+        skills = await source.get_skills()
+        resource_names = [r.name for r in skills[0]._resources]
+        assert "data.json" in resource_names
+
+    async def test_from_paths_passes_directories(self, tmp_path: Path) -> None:
+        """from_paths passes resource_directories and script_directories through."""
+        skill_dir = tmp_path / "my-skill"
+        docs = skill_dir / "docs"
+        docs.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: my-skill\ndescription: test\n---\nBody",
+            encoding="utf-8",
+        )
+        (docs / "guide.md").write_text("guide", encoding="utf-8")
+
+        provider = SkillsProvider.from_paths(
+            str(tmp_path),
+            resource_directories=["docs"],
+        )
+        await _init_provider(provider)
+        skill = _ctx(provider)[0]["my-skill"]
+        resource_names = [r.name for r in skill._resources]
+        assert "docs/guide.md" in resource_names
 
 
 # ---------------------------------------------------------------------------
@@ -1887,6 +2161,145 @@ class TestExtractFrontmatterEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _extract_frontmatter block scalar parsing
+# ---------------------------------------------------------------------------
+
+
+class TestExtractFrontmatterBlockScalars:
+    """Tests for YAML block scalar (| and >) parsing in _extract_frontmatter."""
+
+    def test_literal_block_scalar(self) -> None:
+        content = "---\nname: test-skill\ndescription: |\n  Line one\n  Line two\n---\nBody."
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "Line one\nLine two\n"
+
+    def test_folded_block_scalar(self) -> None:
+        content = "---\nname: test-skill\ndescription: >\n  This is a multi-line\n  description block\n---\nBody."
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "This is a multi-line description block"
+
+    def test_literal_strip_chomping(self) -> None:
+        content = "---\nname: test-skill\ndescription: |-\n  No trailing newline\n---\nBody."
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "No trailing newline"
+
+    def test_folded_strip_chomping(self) -> None:
+        content = "---\nname: test-skill\ndescription: >-\n  Folded with\n  strip chomping\n---\nBody."
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "Folded with strip chomping"
+
+    def test_literal_keep_chomping(self) -> None:
+        content = "---\nname: test-skill\ndescription: |+\n  Keep trailing\n---\nBody."
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "Keep trailing\n"
+
+    def test_folded_keep_chomping(self) -> None:
+        content = "---\nname: test-skill\ndescription: >+\n  Keep trailing\n  newline\n---\nBody."
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "Keep trailing newline\n"
+
+    def test_block_scalar_no_continuation_lines(self) -> None:
+        content = "---\nname: test-skill\ndescription: |\nlicense: MIT\n---\nBody."
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        # description becomes empty string which fails validation (empty/whitespace)
+        assert result is None
+
+    def test_block_scalar_varying_indentation(self) -> None:
+        content = (
+            "---\n"
+            "name: test-skill\n"
+            "description: |\n"
+            "    Line with 4-space indent\n"
+            "    Line with 4-space indent\n"
+            "---\n"
+            "Body."
+        )
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "Line with 4-space indent\nLine with 4-space indent\n"
+
+    def test_folded_block_scalar_real_skill_format(self) -> None:
+        """End-to-end test matching the format used in .github/skills/ SKILL.md files."""
+        content = (
+            "---\n"
+            "name: python-development\n"
+            "description: >\n"
+            "  Coding standards, conventions, and patterns for developing Python code in the\n"
+            "  Agent Framework repository. Use this when writing or modifying Python source\n"
+            "  files in the python/ directory.\n"
+            "---\n"
+            "\n"
+            "# Python Development Standards\n"
+        )
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == (
+            "Coding standards, conventions, and patterns for developing Python code in the "
+            "Agent Framework repository. Use this when writing or modifying Python source "
+            "files in the python/ directory."
+        )
+
+    def test_block_scalar_with_other_fields_after(self) -> None:
+        content = "---\nname: test-skill\ndescription: >\n  A folded\n  description\nlicense: MIT\n---\nBody."
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "A folded description"
+        assert result.license == "MIT"
+
+    def test_plain_value_unchanged(self) -> None:
+        """Non-block-scalar values must not be affected by the block scalar logic."""
+        content = "---\nname: test-skill\ndescription: A simple description.\n---\nBody."
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "A simple description."
+
+    def test_block_scalar_content_with_colons(self) -> None:
+        """Lines inside a block scalar that look like YAML key-value pairs must be preserved verbatim."""
+        content = (
+            "---\nname: test-skill\ndescription: |\n  Some text with colon: in it\n  Another: line here\n---\nBody."
+        )
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "Some text with colon: in it\nAnother: line here\n"
+
+    def test_block_scalar_on_license_field(self) -> None:
+        """Block scalars should work on any field, not only description."""
+        content = (
+            "---\n"
+            "name: test-skill\n"
+            "description: A skill.\n"
+            "license: >\n"
+            "  Custom license\n"
+            "  spanning multiple lines\n"
+            "---\n"
+            "Body."
+        )
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.license == "Custom license spanning multiple lines"
+
+    def test_block_scalar_tab_indentation(self) -> None:
+        """Tab characters should count as indentation for block scalar continuation lines."""
+        content = "---\nname: test-skill\ndescription: |\n\tTab-indented line one\n\tTab-indented line two\n---\nBody."
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "Tab-indented line one\nTab-indented line two\n"
+
+    def test_block_scalar_blank_line_within_block(self) -> None:
+        """Blank lines within a block scalar should be preserved as paragraph separators."""
+        content = "---\nname: test-skill\ndescription: |\n  First paragraph\n\n  Second paragraph\n---\nBody."
+        result = FileSkillsSource._extract_frontmatter(content, "test.md")
+        assert result is not None
+        assert result.description == "First paragraph\n\nSecond paragraph\n"
+
+
+# ---------------------------------------------------------------------------
 # Tests: Skill spec fields (via SkillFrontmatter)
 # ---------------------------------------------------------------------------
 
@@ -2190,40 +2603,46 @@ class TestCreateInstructionsEdgeCases:
         assert alpha_pos < bravo_pos < charlie_pos
 
     def test_custom_template_missing_runner_instructions_raises(self) -> None:
-        """Custom template without {runner_instructions} raises when scripts are enabled."""
+        """Custom templates may omit {runner_instructions}."""
         skills = [
             InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="Skill."), instructions="Body"),
         ]
         template = "Skills: {skills}"
-        with pytest.raises(ValueError, match="runner_instructions"):
-            SkillsProvider._create_instructions(template, skills, include_script_runner_instructions=True)
+        result = SkillsProvider._create_instructions(template, skills)
+        assert result is not None
+        assert result.startswith("Skills:   <skill>")
+        assert "<name>my-skill</name>" in result
+        assert "<description>Skill.</description>" in result
 
     def test_custom_template_missing_resource_instructions_raises(self) -> None:
-        """Custom template without {resource_instructions} raises when resources exist."""
+        """Custom templates may omit {resource_instructions}."""
         skills = [
             InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="Skill."), instructions="Body"),
         ]
         template = "Skills: {skills}"
-        with pytest.raises(ValueError, match="resource_instructions"):
-            SkillsProvider._create_instructions(template, skills, include_resource_instructions=True)
+        result = SkillsProvider._create_instructions(template, skills)
+        assert result is not None
+        assert result.startswith("Skills:   <skill>")
+        assert "<name>my-skill</name>" in result
+        assert "<description>Skill.</description>" in result
 
     def test_include_resource_instructions_true_adds_resource_text(self) -> None:
-        """When include_resource_instructions is True, resource instructions appear in the prompt."""
+        """Resource instructions always appear in the prompt."""
         skills = [
             InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="Skill."), instructions="Body"),
         ]
-        result = SkillsProvider._create_instructions(None, skills, include_resource_instructions=True)
+        result = SkillsProvider._create_instructions(None, skills)
         assert result is not None
         assert "read_skill_resource" in result
 
     def test_include_resource_instructions_false_omits_resource_text(self) -> None:
-        """When include_resource_instructions is False, resource instructions do not appear."""
+        """Resource instructions are still included by default."""
         skills = [
             InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="Skill."), instructions="Body"),
         ]
-        result = SkillsProvider._create_instructions(None, skills, include_resource_instructions=False)
+        result = SkillsProvider._create_instructions(None, skills)
         assert result is not None
-        assert "read_skill_resource" not in result
+        assert "read_skill_resource" in result
 
     def test_custom_template_with_unknown_placeholder_raises(self) -> None:
         """Template with an unknown placeholder raises ValueError."""
@@ -2233,6 +2652,39 @@ class TestCreateInstructionsEdgeCases:
         template = "Skills: {skills} {unknown_key}"
         with pytest.raises(ValueError, match="valid format string"):
             SkillsProvider._create_instructions(template, skills)
+
+    def test_custom_template_with_all_placeholders_fills_them(self) -> None:
+        """Custom template with all three placeholders fills each one."""
+        skills = [
+            InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="Skill."), instructions="Body"),
+        ]
+        template = "SKILLS:{skills}\nRUNNER:{runner_instructions}\nRESOURCE:{resource_instructions}"
+        result = SkillsProvider._create_instructions(template, skills)
+        assert result is not None
+        assert "<name>my-skill</name>" in result
+        assert "run_skill_script" in result
+        assert "read_skill_resource" in result
+
+    def test_custom_template_omitting_runner_excludes_runner_text(self) -> None:
+        """Omitting {runner_instructions} from a custom template excludes script guidance."""
+        skills = [
+            InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="Skill."), instructions="Body"),
+        ]
+        template = "Skills: {skills}"
+        result = SkillsProvider._create_instructions(template, skills)
+        assert result is not None
+        assert "run_skill_script" not in result
+
+    def test_custom_template_omitting_resource_excludes_resource_text(self) -> None:
+        """Omitting {resource_instructions} from a custom template excludes resource guidance."""
+        skills = [
+            InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="Skill."), instructions="Body"),
+        ]
+        template = "Skills: {skills} {runner_instructions}"
+        result = SkillsProvider._create_instructions(template, skills)
+        assert result is not None
+        assert "run_skill_script" in result
+        assert "read_skill_resource" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -2253,7 +2705,7 @@ class TestSkillsProviderEdgeCases:
         _write_skill(tmp_path, "my-skill")
         provider = SkillsProvider.from_paths(str(tmp_path))
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "   ")
+        result = await provider._load_skill(_raw_skills(provider), "   ")
         assert result.startswith("Error:")
         assert "empty" in result
 
@@ -2304,7 +2756,7 @@ class TestSkillsProviderEdgeCases:
         )
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "my-skill")
+        result = await provider._load_skill(_raw_skills(provider), "my-skill")
         assert "&lt;tags&gt;" in result
         assert "&amp;" in result
 
@@ -2326,9 +2778,9 @@ class TestSkillsProviderEdgeCases:
 
         await provider.before_run(agent=AsyncMock(), session=AsyncMock(), context=context, state={})
 
-        assert len(context.tools) == 1
         tool_names = {t.name for t in context.tools}
-        assert "load_skill" in tool_names
+        assert len(context.tools) == 3
+        assert tool_names == {"load_skill", "read_skill_resource", "run_skill_script"}
 
 
 # ---------------------------------------------------------------------------
@@ -2438,7 +2890,7 @@ class TestSkillResourceDecoratorEdgeCases:
         def no_docs() -> Any:
             return "data"
 
-        assert skill.resources[0].description is None
+        assert skill._resources[0].description is None
 
     def test_decorator_with_name_only(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="A skill."), instructions="Body")
@@ -2448,9 +2900,9 @@ class TestSkillResourceDecoratorEdgeCases:
             """Some docs."""
             return "data"
 
-        assert skill.resources[0].name == "custom-name"
+        assert skill._resources[0].name == "custom-name"
         # description is None when not explicitly provided
-        assert skill.resources[0].description is None
+        assert skill._resources[0].description is None
 
     def test_decorator_with_description_only(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="A skill."), instructions="Body")
@@ -2459,8 +2911,8 @@ class TestSkillResourceDecoratorEdgeCases:
         def get_data() -> Any:
             return "data"
 
-        assert skill.resources[0].name == "get_data"
-        assert skill.resources[0].description == "Custom desc"
+        assert skill._resources[0].name == "get_data"
+        assert skill._resources[0].description == "Custom desc"
 
     def test_decorator_preserves_original_function_identity(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="A skill."), instructions="Body")
@@ -2633,11 +3085,11 @@ class TestSkillScriptDecorator:
             """Run analysis."""
             return "result"
 
-        assert len(skill.scripts) == 1
-        assert skill.scripts[0].name == "analyze"
-        assert skill.scripts[0].description is None
-        assert isinstance(skill.scripts[0], InlineSkillScript)
-        assert skill.scripts[0].function is analyze
+        assert len(skill._scripts) == 1
+        assert skill._scripts[0].name == "analyze"
+        assert skill._scripts[0].description is None
+        assert isinstance(skill._scripts[0], InlineSkillScript)
+        assert skill._scripts[0].function is analyze
 
     def test_parameterized_decorator(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
@@ -2646,11 +3098,11 @@ class TestSkillScriptDecorator:
         def my_func() -> str:
             return "data"
 
-        assert len(skill.scripts) == 1
-        assert skill.scripts[0].name == "custom-name"
-        assert skill.scripts[0].description == "Custom desc"
-        assert isinstance(skill.scripts[0], InlineSkillScript)
-        assert skill.scripts[0].function is my_func
+        assert len(skill._scripts) == 1
+        assert skill._scripts[0].name == "custom-name"
+        assert skill._scripts[0].description == "Custom desc"
+        assert isinstance(skill._scripts[0], InlineSkillScript)
+        assert skill._scripts[0].function is my_func
 
     def test_multiple_scripts(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
@@ -2663,9 +3115,9 @@ class TestSkillScriptDecorator:
         def script_b() -> str:
             return "b"
 
-        assert len(skill.scripts) == 2
-        assert skill.scripts[0].name == "script_a"
-        assert skill.scripts[1].name == "script_b"
+        assert len(skill._scripts) == 2
+        assert skill._scripts[0].name == "script_a"
+        assert skill._scripts[1].name == "script_b"
 
     def test_async_script(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
@@ -2675,10 +3127,10 @@ class TestSkillScriptDecorator:
             """Fetch remote data."""
             return "data"
 
-        assert len(skill.scripts) == 1
-        assert skill.scripts[0].name == "fetch_data"
-        assert isinstance(skill.scripts[0], InlineSkillScript)
-        assert skill.scripts[0].function is fetch_data
+        assert len(skill._scripts) == 1
+        assert skill._scripts[0].name == "fetch_data"
+        assert isinstance(skill._scripts[0], InlineSkillScript)
+        assert skill._scripts[0].function is fetch_data
 
     def test_decorator_returns_original_function(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
@@ -2705,15 +3157,15 @@ class TestSkillWithScripts:
 
     def test_default_empty_scripts(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        assert skill.scripts == []
+        assert skill._scripts == []
 
     def test_scripts_at_construction(self) -> None:
         scripts = [InlineSkillScript(name="s1", function=lambda: None)]
         skill = InlineSkill(
             frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body", scripts=scripts
         )
-        assert len(skill.scripts) == 1
-        assert skill.scripts[0].name == "s1"
+        assert len(skill._scripts) == 1
+        assert skill._scripts[0].name == "s1"
 
 
 # ---------------------------------------------------------------------------
@@ -2735,7 +3187,7 @@ class TestSkillScriptRunnerProtocol:
 
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="test-skill", description="test"), instructions="body")
         script = FileSkillScript(name="my-script", full_path=f"{_ABS}/test/scripts/run.py")
-        skill.scripts.append(script)
+        skill._scripts.append(script)
 
         result = await my_runner(skill, script, args={"key": "val"})
 
@@ -2753,7 +3205,7 @@ class TestSkillScriptRunnerProtocol:
 
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="test-skill", description="test"), instructions="body")
         script = InlineSkillScript(name="my-script", function=lambda: None)
-        skill.scripts.append(script)
+        skill._scripts.append(script)
 
         result = await runner(skill, script, args={"key": "val"})
         assert result == "custom result"
@@ -2789,7 +3241,7 @@ class TestSkillScriptRunnerProtocol:
 
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="test-skill", description="test"), instructions="body")
         script = FileSkillScript(name="my-script", full_path=f"{_ABS}/test/scripts/run.py")
-        skill.scripts.append(script)
+        skill._scripts.append(script)
 
         result = my_runner(skill, script, args={"key": "val"})
 
@@ -2807,7 +3259,7 @@ class TestSkillScriptRunnerProtocol:
 
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="test-skill", description="test"), instructions="body")
         script = InlineSkillScript(name="my-script", function=lambda: None)
-        skill.scripts.append(script)
+        skill._scripts.append(script)
 
         result = runner(skill, script, args={"key": "val"})
         assert result == "sync result"
@@ -2843,7 +3295,7 @@ class TestSkillsProviderFactories:
 
     async def test_code_skills_with_scripts_creates_provider(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -2855,16 +3307,18 @@ class TestSkillsProviderFactories:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        # No scripts with functions, no runner, no resources — only load_skill
-        assert len(_ctx(provider)[2]) == 1
-        assert not any(hasattr(t, "name") and t.name == "run_skill_script" for t in _ctx(provider)[2])
+        assert {t.name for t in _ctx(provider)[2] if hasattr(t, "name")} == {
+            "load_skill",
+            "read_skill_resource",
+            "run_skill_script",
+        }
 
     async def test_code_script_runs_directly(self) -> None:
         def my_function(key: str = "") -> str:
             return f"executed: {key}"
 
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=my_function))
+        skill._scripts.append(InlineSkillScript(name="s1", function=my_function))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -2875,22 +3329,21 @@ class TestSkillsProviderFactories:
 
     async def test_no_scripts_no_tool(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        # No scripts at all — no run_skill_script tool
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        assert not any(hasattr(t, "name") and t.name == "run_skill_script" for t in _ctx(provider)[2])
+        assert any(hasattr(t, "name") and t.name == "run_skill_script" for t in _ctx(provider)[2])
 
     async def test_no_resources_no_read_skill_resource_tool(self) -> None:
-        """When no skill has resources, read_skill_resource tool is not advertised."""
+        """read_skill_resource is advertised even when no skill has resources."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        assert not any(hasattr(t, "name") and t.name == "read_skill_resource" for t in _ctx(provider)[2])
+        assert any(hasattr(t, "name") and t.name == "read_skill_resource" for t in _ctx(provider)[2])
 
     async def test_resources_present_includes_read_skill_resource_tool(self) -> None:
         """When a skill has resources, read_skill_resource tool is advertised."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.resources.append(InlineSkillResource(name="ref", content="reference data"))
+        skill._resources.append(InlineSkillResource(name="ref", content="reference data"))
         provider = SkillsProvider([skill])
         await _init_provider(provider)
         assert any(hasattr(t, "name") and t.name == "read_skill_resource" for t in _ctx(provider)[2])
@@ -2898,22 +3351,22 @@ class TestSkillsProviderFactories:
     async def test_resources_present_includes_resource_instructions(self) -> None:
         """When a skill has resources, instructions mention read_skill_resource."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.resources.append(InlineSkillResource(name="ref", content="reference data"))
+        skill._resources.append(InlineSkillResource(name="ref", content="reference data"))
         provider = SkillsProvider([skill])
         await _init_provider(provider)
         assert "read_skill_resource" in (_ctx(provider)[1] or "")
 
     async def test_no_resources_excludes_resource_instructions(self) -> None:
-        """When no skill has resources, instructions do not mention read_skill_resource."""
+        """read_skill_resource instructions are included even without resources."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        assert "read_skill_resource" not in (_ctx(provider)[1] or "")
+        assert "read_skill_resource" in (_ctx(provider)[1] or "")
 
     async def test_read_skill_resource_tool_returns_content(self) -> None:
         """The read_skill_resource tool returns resource content when invoked."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.resources.append(InlineSkillResource(name="ref", content="reference data"))
+        skill._resources.append(InlineSkillResource(name="ref", content="reference data"))
         provider = SkillsProvider([skill])
         await _init_provider(provider)
         read_tool = next(t for t in _ctx(provider)[2] if hasattr(t, "name") and t.name == "read_skill_resource")
@@ -2928,12 +3381,13 @@ class TestSkillsProviderFactories:
         assert isinstance(_CustomRunner(), SkillScriptRunner)
 
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: test\n---\nBody",
             encoding="utf-8",
         )
-        (skill_dir / "run.py").write_text("print('hi')", encoding="utf-8")
+        (scripts_dir / "run.py").write_text("print('hi')", encoding="utf-8")
 
         provider = SkillsProvider.from_paths(
             str(tmp_path),
@@ -2949,12 +3403,13 @@ class TestSkillsProviderFactories:
         assert isinstance(sync_runner, SkillScriptRunner)
 
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: test\n---\nBody",
             encoding="utf-8",
         )
-        (skill_dir / "run.py").write_text("print('hi')", encoding="utf-8")
+        (scripts_dir / "run.py").write_text("print('hi')", encoding="utf-8")
 
         provider = SkillsProvider.from_paths(
             str(tmp_path),
@@ -2966,12 +3421,13 @@ class TestSkillsProviderFactories:
     async def test_file_script_with_sync_runner_executes(self, tmp_path: Path) -> None:
         """A sync script_runner is awaitable through the provider's run_skill_script."""
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: test\n---\nBody",
             encoding="utf-8",
         )
-        (skill_dir / "run.py").write_text("print('hi')", encoding="utf-8")
+        (scripts_dir / "run.py").write_text("print('hi')", encoding="utf-8")
 
         def sync_runner(skill, script, args=None):
             return f"sync: {script.name} args={args}"
@@ -2982,17 +3438,18 @@ class TestSkillsProviderFactories:
         )
         await _init_provider(provider)
         run_tool = next(t for t in _ctx(provider)[2] if hasattr(t, "name") and t.name == "run_skill_script")
-        result = await run_tool.func(skill_name="my-skill", script_name="run.py", args={"key": "val"})
-        assert result == "sync: run.py args={'key': 'val'}"
+        result = await run_tool.func(skill_name="my-skill", script_name="scripts/run.py", args={"key": "val"})
+        assert result == "sync: scripts/run.py args={'key': 'val'}"
 
     async def test_file_skills_with_callback_runner(self, tmp_path: Path) -> None:
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: test\n---\nBody",
             encoding="utf-8",
         )
-        (skill_dir / "run.py").write_text("print('hi')", encoding="utf-8")
+        (scripts_dir / "run.py").write_text("print('hi')", encoding="utf-8")
 
         provider = SkillsProvider.from_paths(
             str(tmp_path),
@@ -3012,7 +3469,7 @@ class TestSkillsProviderFactories:
         code_skill = InlineSkill(
             frontmatter=SkillFrontmatter(name="code-skill", description="test"), instructions="body"
         )
-        code_skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        code_skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider(
             DeduplicatingSkillsSource(
@@ -3028,12 +3485,13 @@ class TestSkillsProviderFactories:
 
     async def test_file_scripts_without_runner_no_error_at_init(self, tmp_path: Path) -> None:
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: test\n---\nBody",
             encoding="utf-8",
         )
-        (skill_dir / "run.py").write_text("print('hi')", encoding="utf-8")
+        (scripts_dir / "run.py").write_text("print('hi')", encoding="utf-8")
 
         provider = SkillsProvider.from_paths(str(tmp_path))
         # Initialization succeeds; the error now surfaces at script.run() time
@@ -3042,8 +3500,8 @@ class TestSkillsProviderFactories:
     async def test_file_script_error_without_runner(self) -> None:
         # A skill with both a code script and a file-based script
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="code-s", function=lambda: "ok"))
-        skill.scripts.append(FileSkillScript(name="file-s", full_path=f"{_ABS}/test/scripts/s1.py"))
+        skill._scripts.append(InlineSkillScript(name="code-s", function=lambda: "ok"))
+        skill._scripts.append(FileSkillScript(name="file-s", full_path=f"{_ABS}/test/scripts/s1.py"))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -3063,7 +3521,7 @@ class TestSkillsProviderFactories:
             return f"async: {x}"
 
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=async_func))
+        skill._scripts.append(InlineSkillScript(name="s1", function=async_func))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -3078,7 +3536,7 @@ class TestSkillsProviderFactories:
             return {"status": "ok", "value": 42}
 
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=returns_dict))
+        skill._scripts.append(InlineSkillScript(name="s1", function=returns_dict))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -3089,7 +3547,7 @@ class TestSkillsProviderFactories:
     async def test_code_script_returns_none(self) -> None:
         """Code-defined scripts returning None pass through as None."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -3100,8 +3558,8 @@ class TestSkillsProviderFactories:
     async def test_script_with_path_errors_without_runner(self) -> None:
         """A file-based script without a runner should return an error."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="code-s", function=lambda: "ok"))
-        skill.scripts.append(FileSkillScript(name="path-s", full_path=f"{_ABS}/test/scripts/s1.py"))
+        skill._scripts.append(InlineSkillScript(name="code-s", function=lambda: "ok"))
+        skill._scripts.append(FileSkillScript(name="path-s", full_path=f"{_ABS}/test/scripts/s1.py"))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -3118,7 +3576,7 @@ class TestSkillsProviderFactories:
 
     async def test_run_skill_script_error_on_missing_skill(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -3189,7 +3647,7 @@ class TestSkillsProviderFactories:
 
     async def test_run_skill_script_error_on_missing_script(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -3200,7 +3658,7 @@ class TestSkillsProviderFactories:
 
     async def test_run_skill_script_error_on_empty_names(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -3214,7 +3672,7 @@ class TestSkillsProviderFactories:
 
     async def test_instructions_include_script_runner_hints(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -3225,24 +3683,22 @@ class TestSkillsProviderFactories:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        # No scripts and no runner — instructions should not mention run_skill_script
-        assert "run_skill_script" not in (_ctx(provider)[1] or "")
+        assert "run_skill_script" in (_ctx(provider)[1] or "")
 
     async def test_tool_schema_args_description_mentions_key_format(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
         run_tool = next(t for t in _ctx(provider)[2] if hasattr(t, "name") and t.name == "run_skill_script")
         args_desc = run_tool.parameters()["properties"]["args"]["description"]
-        assert "without leading dashes" in args_desc
         assert "script implementation or configured runner" in args_desc
 
     async def test_require_script_approval_sets_approval_mode(self) -> None:
         """When require_script_approval=True, the run_skill_script tool has approval_mode='always_require'."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider([skill], require_script_approval=True)
         await _init_provider(provider)
@@ -3252,7 +3708,7 @@ class TestSkillsProviderFactories:
     async def test_require_script_approval_false_by_default(self) -> None:
         """By default, the run_skill_script tool has approval_mode='never_require'."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -3260,14 +3716,14 @@ class TestSkillsProviderFactories:
         assert run_tool.approval_mode == "never_require"
 
     async def test_require_script_approval_does_not_affect_other_tools(self) -> None:
-        """The load_skill tool should never require approval."""
+        """Non-script tools should never require approval."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider([skill], require_script_approval=True)
         await _init_provider(provider)
         other_tools = [t for t in _ctx(provider)[2] if hasattr(t, "name") and t.name != "run_skill_script"]
-        assert len(other_tools) == 1
+        assert len(other_tools) == 2
         for t in other_tools:
             assert t.approval_mode == "never_require"
 
@@ -3278,7 +3734,7 @@ class TestSkillsProviderFactories:
             raise RuntimeError("Something went wrong")
 
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="boom", function=failing_script))
+        skill._scripts.append(InlineSkillScript(name="boom", function=failing_script))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -3289,16 +3745,20 @@ class TestSkillsProviderFactories:
         assert "Something went wrong" not in result
 
     async def test_custom_template_without_runner_placeholder_raises(self) -> None:
-        """Provider with code scripts and custom template missing {runner_instructions} raises."""
+        """Providers accept custom templates without {runner_instructions}."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider(
             [skill],
             instruction_template="Skills: {skills}",
         )
-        with pytest.raises(ValueError, match="runner_instructions"):
-            await _init_provider(provider)
+        await _init_provider(provider)
+        instructions = _ctx(provider)[1]
+        assert instructions is not None
+        assert instructions.startswith("Skills:   <skill>")
+        assert "<name>my-skill</name>" in instructions
+        assert "<description>test</description>" in instructions
 
 
 # ---------------------------------------------------------------------------
@@ -3309,7 +3769,23 @@ class TestSkillsProviderFactories:
 class TestFileScriptDiscovery:
     """Tests for automatic .py script discovery in skill directories."""
 
-    async def test_discovers_py_files(self, tmp_path: Path) -> None:
+    async def test_discovers_py_files_in_scripts_dir(self, tmp_path: Path) -> None:
+        skill_dir = tmp_path / "my-skill"
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: my-skill\ndescription: test\n---\nBody",
+            encoding="utf-8",
+        )
+        (scripts_dir / "analyze.py").write_text("print('hi')", encoding="utf-8")
+
+        skills = await _discover_file_skills_for_test(str(tmp_path))
+        assert "my-skill" in skills
+        assert len(skills["my-skill"]._scripts) == 1
+        assert skills["my-skill"]._scripts[0].name == "scripts/analyze.py"
+
+    async def test_root_py_files_not_discovered_by_default(self, tmp_path: Path) -> None:
+        """Scripts at the skill root are NOT discovered with default directories."""
         skill_dir = tmp_path / "my-skill"
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text(
@@ -3320,8 +3796,7 @@ class TestFileScriptDiscovery:
 
         skills = await _discover_file_skills_for_test(str(tmp_path))
         assert "my-skill" in skills
-        assert len(skills["my-skill"].scripts) == 1
-        assert skills["my-skill"].scripts[0].name == "analyze.py"
+        assert len(skills["my-skill"]._scripts) == 0
 
     async def test_discovered_script_has_absolute_full_path(self, tmp_path: Path) -> None:
         skill_dir = tmp_path / "my-skill"
@@ -3334,13 +3809,14 @@ class TestFileScriptDiscovery:
         (scripts_dir / "generate.py").write_text("print('gen')", encoding="utf-8")
 
         skills = await _discover_file_skills_for_test(str(tmp_path))
-        script = skills["my-skill"].scripts[0]
+        script = skills["my-skill"]._scripts[0]
         assert script.full_path is not None
         assert os.path.isabs(script.full_path)
         expected = str(Path(str(skill_dir), "scripts", "generate.py"))
         assert script.full_path == expected
 
-    async def test_discovers_nested_scripts(self, tmp_path: Path) -> None:
+    async def test_scripts_not_discovered_recursively(self, tmp_path: Path) -> None:
+        """Scripts inside subdirectories of scripts/ are NOT discovered (non-recursive)."""
         skill_dir = tmp_path / "my-skill"
         scripts_dir = skill_dir / "scripts"
         scripts_dir.mkdir(parents=True)
@@ -3348,11 +3824,16 @@ class TestFileScriptDiscovery:
             "---\nname: my-skill\ndescription: test\n---\nBody",
             encoding="utf-8",
         )
-        (scripts_dir / "generate.py").write_text("print('gen')", encoding="utf-8")
+        # File directly in scripts/ is discovered
+        (scripts_dir / "top.py").write_text("print('top')", encoding="utf-8")
+        # File in scripts/sub/ is NOT discovered
+        sub_dir = scripts_dir / "sub"
+        sub_dir.mkdir()
+        (sub_dir / "nested.py").write_text("print('nested')", encoding="utf-8")
 
         skills = await _discover_file_skills_for_test(str(tmp_path))
-        assert len(skills["my-skill"].scripts) == 1
-        assert skills["my-skill"].scripts[0].name == "scripts/generate.py"
+        assert len(skills["my-skill"]._scripts) == 1
+        assert skills["my-skill"]._scripts[0].name == "scripts/top.py"
 
     async def test_no_scripts_when_no_py_files(self, tmp_path: Path) -> None:
         skill_dir = tmp_path / "my-skill"
@@ -3364,7 +3845,7 @@ class TestFileScriptDiscovery:
         (skill_dir / "readme.md").write_text("# Docs", encoding="utf-8")
 
         skills = await _discover_file_skills_for_test(str(tmp_path))
-        assert len(skills["my-skill"].scripts) == 0
+        assert len(skills["my-skill"]._scripts) == 0
 
 
 class TestCustomScriptExtensions:
@@ -3373,36 +3854,38 @@ class TestCustomScriptExtensions:
     async def test_custom_script_extensions_via_get_skills(self, tmp_path: Path) -> None:
         """get_skills() forwards script_extensions to _discover_script_files."""
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: test\n---\nBody",
             encoding="utf-8",
         )
-        (skill_dir / "analyze.py").write_text("print('hi')", encoding="utf-8")
-        (skill_dir / "run.sh").write_text("#!/bin/bash", encoding="utf-8")
+        (scripts_dir / "analyze.py").write_text("print('hi')", encoding="utf-8")
+        (scripts_dir / "run.sh").write_text("#!/bin/bash", encoding="utf-8")
 
         # Default: only .py discovered
         skills_default = await _discover_file_skills_for_test(str(tmp_path))
-        script_names_default = [s.name for s in skills_default["my-skill"].scripts]
-        assert "analyze.py" in script_names_default
-        assert "run.sh" not in script_names_default
+        script_names_default = [s.name for s in skills_default["my-skill"]._scripts]
+        assert "scripts/analyze.py" in script_names_default
+        assert "scripts/run.sh" not in script_names_default
 
         # Custom: only .sh discovered
         skills_custom = await _discover_file_skills_for_test(str(tmp_path), script_extensions=(".sh",))
-        script_names_custom = [s.name for s in skills_custom["my-skill"].scripts]
-        assert "run.sh" in script_names_custom
-        assert "analyze.py" not in script_names_custom
+        script_names_custom = [s.name for s in skills_custom["my-skill"]._scripts]
+        assert "scripts/run.sh" in script_names_custom
+        assert "scripts/analyze.py" not in script_names_custom
 
     async def test_custom_script_extensions_via_provider(self, tmp_path: Path) -> None:
         """SkillsProvider accepts custom script_extensions."""
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: test\n---\nBody",
             encoding="utf-8",
         )
-        (skill_dir / "analyze.py").write_text("print('hi')", encoding="utf-8")
-        (skill_dir / "run.sh").write_text("#!/bin/bash", encoding="utf-8")
+        (scripts_dir / "analyze.py").write_text("print('hi')", encoding="utf-8")
+        (scripts_dir / "run.sh").write_text("#!/bin/bash", encoding="utf-8")
 
         # Only discover .sh scripts
         provider = SkillsProvider.from_paths(
@@ -3412,21 +3895,22 @@ class TestCustomScriptExtensions:
         )
         await _init_provider(provider)
         skill = _ctx(provider)[0]["my-skill"]
-        script_names = [s.name for s in skill.scripts]
-        assert "run.sh" in script_names
-        assert "analyze.py" not in script_names
+        script_names = [s.name for s in skill._scripts]
+        assert "scripts/run.sh" in script_names
+        assert "scripts/analyze.py" not in script_names
 
     async def test_multiple_script_extensions(self, tmp_path: Path) -> None:
         """Multiple script extensions can be specified."""
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: test\n---\nBody",
             encoding="utf-8",
         )
-        (skill_dir / "analyze.py").write_text("print('hi')", encoding="utf-8")
-        (skill_dir / "run.sh").write_text("#!/bin/bash", encoding="utf-8")
-        (skill_dir / "notes.txt").write_text("notes", encoding="utf-8")
+        (scripts_dir / "analyze.py").write_text("print('hi')", encoding="utf-8")
+        (scripts_dir / "run.sh").write_text("#!/bin/bash", encoding="utf-8")
+        (scripts_dir / "notes.txt").write_text("notes", encoding="utf-8")
 
         provider = SkillsProvider.from_paths(
             str(tmp_path),
@@ -3435,10 +3919,10 @@ class TestCustomScriptExtensions:
         )
         await _init_provider(provider)
         skill = _ctx(provider)[0]["my-skill"]
-        script_names = [s.name for s in skill.scripts]
-        assert "analyze.py" in script_names
-        assert "run.sh" in script_names
-        assert "notes.txt" not in script_names
+        script_names = [s.name for s in skill._scripts]
+        assert "scripts/analyze.py" in script_names
+        assert "scripts/run.sh" in script_names
+        assert "scripts/notes.txt" not in script_names
 
     def test_default_script_extensions_unchanged(self) -> None:
         """DEFAULT_SCRIPT_EXTENSIONS contains only .py."""
@@ -3455,7 +3939,7 @@ class TestCreateInstructionsWithScripts:
 
     def test_excludes_script_count(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         result = SkillsProvider._create_instructions(None, [skill])
         assert result is not None
@@ -3479,11 +3963,11 @@ class TestLoadSkillWithScripts:
 
     async def test_code_skill_includes_scripts_element(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="analyze", description="Run analysis", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="analyze", description="Run analysis", function=lambda: None))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "my-skill")
+        result = await provider._load_skill(_raw_skills(provider), "my-skill")
 
         assert "<scripts>" in result
         assert 'name="analyze"' in result
@@ -3493,7 +3977,7 @@ class TestLoadSkillWithScripts:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "my-skill")
+        result = await provider._load_skill(_raw_skills(provider), "my-skill")
         assert "<scripts>" not in result
 
 
@@ -3560,25 +4044,25 @@ class TestClassSkill:
         skill = _MinimalClassSkill()
         assert skill.scripts == []
 
-    def test_minimal_skill_content_contains_name(self) -> None:
+    async def test_minimal_skill_content_contains_name(self) -> None:
         skill = _MinimalClassSkill()
-        assert "<name>minimal-skill</name>" in skill.content
+        assert "<name>minimal-skill</name>" in (await skill.get_content())
 
-    def test_minimal_skill_content_contains_description(self) -> None:
+    async def test_minimal_skill_content_contains_description(self) -> None:
         skill = _MinimalClassSkill()
-        assert "<description>A minimal skill.</description>" in skill.content
+        assert "<description>A minimal skill.</description>" in (await skill.get_content())
 
-    def test_minimal_skill_content_contains_instructions(self) -> None:
+    async def test_minimal_skill_content_contains_instructions(self) -> None:
         skill = _MinimalClassSkill()
-        assert "Do minimal things." in skill.content
+        assert "Do minimal things." in (await skill.get_content())
 
-    def test_minimal_skill_content_no_resources_element(self) -> None:
+    async def test_minimal_skill_content_no_resources_element(self) -> None:
         skill = _MinimalClassSkill()
-        assert "<resources>" not in skill.content
+        assert "<resources>" not in (await skill.get_content())
 
-    def test_minimal_skill_content_no_scripts_element(self) -> None:
+    async def test_minimal_skill_content_no_scripts_element(self) -> None:
         skill = _MinimalClassSkill()
-        assert "<scripts>" not in skill.content
+        assert "<scripts>" not in (await skill.get_content())
 
     def test_full_skill_has_resources(self) -> None:
         skill = _FullClassSkill()
@@ -3590,20 +4074,20 @@ class TestClassSkill:
         assert len(skill.scripts) == 1
         assert skill.scripts[0].name == "test-script"
 
-    def test_full_skill_content_contains_resources(self) -> None:
+    async def test_full_skill_content_contains_resources(self) -> None:
         skill = _FullClassSkill()
-        assert "<resources>" in skill.content
-        assert 'name="test-resource"' in skill.content
+        assert "<resources>" in (await skill.get_content())
+        assert 'name="test-resource"' in (await skill.get_content())
 
-    def test_full_skill_content_contains_scripts(self) -> None:
+    async def test_full_skill_content_contains_scripts(self) -> None:
         skill = _FullClassSkill()
-        assert "<scripts>" in skill.content
-        assert 'name="test-script"' in skill.content
+        assert "<scripts>" in (await skill.get_content())
+        assert 'name="test-script"' in (await skill.get_content())
 
-    def test_content_is_cached(self) -> None:
+    async def test_content_is_cached(self) -> None:
         skill = _MinimalClassSkill()
-        content1 = skill.content
-        content2 = skill.content
+        content1 = await skill.get_content()
+        content2 = await skill.get_content()
         assert content1 is content2
 
     def test_resources_are_lazy_cached(self) -> None:
@@ -3641,7 +4125,7 @@ class TestClassSkill:
         provider = SkillsProvider([skill])
         await _init_provider(provider)
 
-        result = provider._load_skill(_raw_skills(provider), "full-skill")
+        result = await provider._load_skill(_raw_skills(provider), "full-skill")
         assert "Use this skill for full tasks." in result
         assert "<resources>" in result
         assert "<scripts>" in result
@@ -3859,15 +4343,15 @@ class TestClassSkillDecoratorDiscovery:
         assert s1 == s2
         assert s1 is not s2  # defensive copy
 
-    def test_content_includes_discovered_resources(self) -> None:
+    async def test_content_includes_discovered_resources(self) -> None:
         skill = _DecoratorClassSkill()
-        assert "<resources>" in skill.content
-        assert 'name="lookup-table"' in skill.content
+        assert "<resources>" in (await skill.get_content())
+        assert 'name="lookup-table"' in (await skill.get_content())
 
-    def test_content_includes_discovered_scripts(self) -> None:
+    async def test_content_includes_discovered_scripts(self) -> None:
         skill = _DecoratorClassSkill()
-        assert "<scripts>" in skill.content
-        assert 'name="convert"' in skill.content
+        assert "<scripts>" in (await skill.get_content())
+        assert 'name="convert"' in (await skill.get_content())
 
     def test_duplicate_resource_name_raises(self) -> None:
         skill = _DuplicateResourceSkill()
@@ -3921,9 +4405,9 @@ class TestClassSkillDecoratorDiscovery:
         skill = _PropertyResourceSkill()
         assert skill.resources[0].description is None
 
-    def test_property_resource_in_content(self) -> None:
+    async def test_property_resource_in_content(self) -> None:
         skill = _PropertyResourceSkill()
-        assert 'name="static-table"' in skill.content
+        assert 'name="static-table"' in (await skill.get_content())
 
     async def test_mixed_property_and_method_resources(self) -> None:
         """Property and method resources can coexist."""
@@ -3946,11 +4430,11 @@ class TestClassSkillDecoratorDiscovery:
         scr = next(s for s in skill.scripts if s.name == "described-scr")
         assert scr.description == "A described script."
 
-    def test_explicit_description_in_content_xml(self) -> None:
+    async def test_explicit_description_in_content_xml(self) -> None:
         """Explicit descriptions appear in the skill content XML."""
         skill = _ExplicitDescriptionSkill()
-        assert 'description="A described resource."' in skill.content
-        assert 'description="A described script."' in skill.content
+        assert 'description="A described resource."' in (await skill.get_content())
+        assert 'description="A described script."' in (await skill.get_content())
 
     def test_property_getter_not_called_during_discovery(self) -> None:
         """Property getter must NOT be evaluated when resources are discovered."""
@@ -4258,11 +4742,11 @@ class _MixedPropertyMethodSkill(ClassSkill):
             return "result"
 
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="analyze", description="Run analysis", function=analyze))
+        skill._scripts.append(InlineSkillScript(name="analyze", description="Run analysis", function=analyze))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
-        result = provider._load_skill(_raw_skills(provider), "my-skill")
+        result = await provider._load_skill(_raw_skills(provider), "my-skill")
 
         assert "<scripts>" in result
         assert 'name="analyze"' in result
@@ -4275,7 +4759,7 @@ class TestReadSkillResourceWithScripts:
 
     async def test_reads_script_with_static_content(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="generate.py", function=lambda: "print('hello')"))
+        skill._scripts.append(InlineSkillScript(name="generate.py", function=lambda: "print('hello')"))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -4285,7 +4769,7 @@ class TestReadSkillResourceWithScripts:
 
     async def test_script_not_accessible_via_read_resource(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="run.py", function=lambda: "script output"))
+        skill._scripts.append(InlineSkillScript(name="run.py", function=lambda: "script output"))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -4298,7 +4782,7 @@ class TestReadSkillResourceWithScripts:
             return "async output"
 
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="run.py", function=async_script))
+        skill._scripts.append(InlineSkillScript(name="run.py", function=async_script))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -4307,7 +4791,7 @@ class TestReadSkillResourceWithScripts:
 
     async def test_script_case_insensitive_not_in_resources(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="Generate.py", function=lambda: "code"))
+        skill._scripts.append(InlineSkillScript(name="Generate.py", function=lambda: "code"))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -4316,8 +4800,8 @@ class TestReadSkillResourceWithScripts:
 
     async def test_resource_takes_priority_over_script(self) -> None:
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.resources.append(InlineSkillResource(name="data.py", content="resource content"))
-        skill.scripts.append(InlineSkillScript(name="data.py", function=lambda: "script content"))
+        skill._resources.append(InlineSkillResource(name="data.py", content="resource content"))
+        skill._scripts.append(InlineSkillScript(name="data.py", function=lambda: "script content"))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -4329,7 +4813,7 @@ class TestReadSkillResourceWithScripts:
             raise RuntimeError("boom")
 
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="bad.py", function=failing_script))
+        skill._scripts.append(InlineSkillScript(name="bad.py", function=failing_script))
 
         provider = SkillsProvider([skill])
         await _init_provider(provider)
@@ -4438,12 +4922,16 @@ class TestCreateScriptElement:
     def test_name_only(self) -> None:
         s = FileSkillScript(name="run.py", full_path=f"{_ABS}/test/scripts/run.py")
         elem = _create_script_element(s)
-        assert elem == '  <script name="run.py"/>'
+        assert 'name="run.py"' in elem
+        assert "<parameters_schema>" in elem
+        assert '"type": "array"' in elem
 
     def test_with_description(self) -> None:
         s = FileSkillScript(name="run.py", description="Execute script.", full_path=f"{_ABS}/test/scripts/run.py")
         elem = _create_script_element(s)
-        assert elem == '  <script name="run.py" description="Execute script."/>'
+        assert 'name="run.py"' in elem
+        assert 'description="Execute script."' in elem
+        assert "<parameters_schema>" in elem
 
     def test_xml_escapes_name(self) -> None:
         s = FileSkillScript(name='script"special', full_path=f"{_ABS}/test/scripts/s.py")
@@ -4470,10 +4958,12 @@ class TestCreateScriptElement:
         assert "query" in elem
         assert "&quot;" not in elem
 
-    def test_no_parameters_for_file_script(self) -> None:
+    def test_file_script_includes_array_parameters(self) -> None:
         s = FileSkillScript(name="run.py", full_path=f"{_ABS}/test/scripts/run.py")
         elem = _create_script_element(s)
-        assert "<parameters_schema>" not in elem
+        assert "<parameters_schema>" in elem
+        assert '"type": "array"' in elem
+        assert '"type": "string"' in elem
 
 
 # ---------------------------------------------------------------------------
@@ -4494,7 +4984,7 @@ class TestSkillScriptParametersSchema:
 
     def test_none_for_file_based_script(self) -> None:
         script = FileSkillScript(name="run.py", full_path=f"{_ABS}/test/scripts/run.py")
-        assert script.parameters_schema is None
+        assert script.parameters_schema == {"type": "array", "items": {"type": "string"}}
 
     def test_no_params_function_returns_none(self) -> None:
         def noop() -> None:
@@ -4597,21 +5087,22 @@ class TestSkillsSource:
     async def test_file_skills_source_with_extensions(self, tmp_path: Path) -> None:
         """FileSkillsSource resource_extensions controls extension filtering."""
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        refs = skill_dir / "references"
+        refs.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: Test skill.\n---\nBody.",
             encoding="utf-8",
         )
-        (skill_dir / "data.json").write_text("{}", encoding="utf-8")
-        (skill_dir / "data.csv").write_text("a,b", encoding="utf-8")
+        (refs / "data.json").write_text("{}", encoding="utf-8")
+        (refs / "data.csv").write_text("a,b", encoding="utf-8")
 
         # Only allow .json resources
         source = FileSkillsSource(str(tmp_path), resource_extensions=(".json",))
         skills = await source.get_skills()
         assert len(skills) == 1
-        resource_names = [r.name for r in skills[0].resources]
-        assert "data.json" in resource_names
-        assert "data.csv" not in resource_names
+        resource_names = [r.name for r in skills[0]._resources]
+        assert "references/data.json" in resource_names
+        assert "references/data.csv" not in resource_names
 
     async def test_in_memory_skills_source_returns_all_skills(self) -> None:
         """InMemorySkillsSource returns all provided skills."""
@@ -4840,12 +5331,13 @@ class TestSourceComposition:
     async def test_file_source_with_script_runner(self, tmp_path: Path) -> None:
         """FileSkillsSource with script_runner enables script execution."""
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: test\n---\nBody",
             encoding="utf-8",
         )
-        (skill_dir / "run.py").write_text("print('hi')", encoding="utf-8")
+        (scripts_dir / "run.py").write_text("print('hi')", encoding="utf-8")
 
         source = DeduplicatingSkillsSource(FileSkillsSource(str(tmp_path), script_runner=_noop_script_runner))
         provider = SkillsProvider(source)
@@ -4856,7 +5348,7 @@ class TestSourceComposition:
     async def test_script_approval_on_provider(self) -> None:
         """SkillsProvider with require_script_approval sets the approval mode."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
-        skill.scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
 
         provider = SkillsProvider(
             DeduplicatingSkillsSource(InMemorySkillsSource([skill])),
@@ -4875,12 +5367,13 @@ class TestSourceComposition:
     async def test_per_source_runner(self, tmp_path: Path) -> None:
         """Per-source script runner is used when set on FileSkillsSource."""
         skill_dir = tmp_path / "my-skill"
-        skill_dir.mkdir()
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir(parents=True)
         (skill_dir / "SKILL.md").write_text(
             "---\nname: my-skill\ndescription: test\n---\nBody",
             encoding="utf-8",
         )
-        (skill_dir / "run.py").write_text("print('hi')", encoding="utf-8")
+        (scripts_dir / "run.py").write_text("print('hi')", encoding="utf-8")
 
         call_log: list[str] = []
 
@@ -4894,7 +5387,7 @@ class TestSourceComposition:
 
         # The source-level runner should be discovered and used
         run_tool = next(t for t in _ctx(provider)[2] if hasattr(t, "name") and t.name == "run_skill_script")
-        result = await run_tool.func(skill_name="my-skill", script_name="run.py")
+        result = await run_tool.func(skill_name="my-skill", script_name="scripts/run.py")
         assert result == "source"
         assert call_log == ["source"]
 
@@ -5091,10 +5584,174 @@ class TestSkillsProviderConstructorEdgeCases:
 class TestInlineSkillContentCaching:
     """Tests for InlineSkill.content caching."""
 
-    def test_content_cached_after_first_access(self) -> None:
+    async def test_content_cached_after_first_access(self) -> None:
         """InlineSkill.content returns the same object on subsequent accesses."""
         skill = InlineSkill(frontmatter=SkillFrontmatter(name="test-skill", description="Test"), instructions="Body")
-        first = skill.content
-        second = skill.content
+        first = await skill.get_content()
+        second = await skill.get_content()
         assert first is second  # Same object (cached)
         assert "<name>test-skill</name>" in first
+
+
+# ---------------------------------------------------------------------------
+# Tests: Array-style (list[str]) script arguments
+# ---------------------------------------------------------------------------
+
+
+class TestArrayStyleScriptArgs:
+    """Tests for list[str] arguments on skill scripts (port of .NET PR #5475)."""
+
+    async def test_inline_script_rejects_list_args(self) -> None:
+        """InlineSkillScript.run() raises TypeError when args is a list."""
+        script = InlineSkillScript(name="greet", function=lambda name="world": f"hello {name}")
+        skill = InlineSkill(frontmatter=SkillFrontmatter(name="s", description="d"), instructions="c")
+        with pytest.raises(TypeError, match="requires keyword arguments"):
+            await script.run(skill, args=["hello", "--name", "Alice"])
+
+    async def test_inline_script_error_message_mentions_script_name(self) -> None:
+        """The TypeError message includes the script name for debugging."""
+        script = InlineSkillScript(name="my-script", function=lambda: None)
+        skill = InlineSkill(frontmatter=SkillFrontmatter(name="s", description="d"), instructions="c")
+        with pytest.raises(TypeError, match="my-script"):
+            await script.run(skill, args=["arg1"])
+
+    async def test_file_script_passes_list_to_runner(self) -> None:
+        """FileSkillScript.run() passes list[str] args through to the runner."""
+        captured: dict[str, Any] = {}
+
+        def runner(skill: Any, script: Any, args: Any = None) -> str:
+            captured["args"] = args
+            return "ok"
+
+        script = FileSkillScript(name="run.py", full_path=f"{_ABS}/test/run.py", runner=runner)
+        skill = FileSkill(
+            frontmatter=SkillFrontmatter(name="my-skill", description="d"), content="c", path=f"{_ABS}/test"
+        )
+        result = await script.run(skill, args=["input.docx", "--output", "result.idx"])
+        assert result == "ok"
+        assert captured["args"] == ["input.docx", "--output", "result.idx"]
+
+    async def test_file_script_passes_dict_to_runner(self) -> None:
+        """FileSkillScript.run() still passes dict args through to the runner."""
+        captured: dict[str, Any] = {}
+
+        def runner(skill: Any, script: Any, args: Any = None) -> str:
+            captured["args"] = args
+            return "ok"
+
+        script = FileSkillScript(name="run.py", full_path=f"{_ABS}/test/run.py", runner=runner)
+        skill = FileSkill(
+            frontmatter=SkillFrontmatter(name="my-skill", description="d"), content="c", path=f"{_ABS}/test"
+        )
+        result = await script.run(skill, args={"key": "val"})
+        assert result == "ok"
+        assert captured["args"] == {"key": "val"}
+
+    async def test_file_script_passes_none_to_runner(self) -> None:
+        """FileSkillScript.run() passes None args through to the runner."""
+        captured: dict[str, Any] = {}
+
+        def runner(skill: Any, script: Any, args: Any = None) -> str:
+            captured["args"] = args
+            return "ok"
+
+        script = FileSkillScript(name="run.py", full_path=f"{_ABS}/test/run.py", runner=runner)
+        skill = FileSkill(
+            frontmatter=SkillFrontmatter(name="my-skill", description="d"), content="c", path=f"{_ABS}/test"
+        )
+        result = await script.run(skill)
+        assert result == "ok"
+        assert captured["args"] is None
+
+    def test_file_script_parameters_schema_returns_array(self) -> None:
+        """FileSkillScript.parameters_schema returns the string-array JSON schema."""
+        script = FileSkillScript(name="run.py", full_path=f"{_ABS}/test/run.py")
+        assert script.parameters_schema == {"type": "array", "items": {"type": "string"}}
+
+    async def test_runner_protocol_accepts_list_args(self) -> None:
+        """A runner accepting list[str] args satisfies the SkillScriptRunner protocol."""
+        captured: dict[str, Any] = {}
+
+        def my_runner(skill: Any, script: Any, args: Any = None) -> str:
+            captured["args"] = args
+            return "ok"
+
+        assert isinstance(my_runner, SkillScriptRunner)
+        skill = FileSkill(frontmatter=SkillFrontmatter(name="s", description="d"), content="c", path=f"{_ABS}/test")
+        script = FileSkillScript(name="run.py", full_path=f"{_ABS}/test/run.py")
+        result = my_runner(skill, script, args=["--flag", "value"])
+        assert result == "ok"
+        assert captured["args"] == ["--flag", "value"]
+
+    async def test_tool_schema_accepts_array_args(self) -> None:
+        """The run_skill_script tool schema accepts array-style args via oneOf."""
+        skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: None))
+
+        provider = SkillsProvider([skill])
+        await _init_provider(provider)
+        run_tool = next(t for t in _ctx(provider)[2] if hasattr(t, "name") and t.name == "run_skill_script")
+        args_schema = run_tool.parameters()["properties"]["args"]
+        assert "oneOf" in args_schema
+        types = [s.get("type") for s in args_schema["oneOf"]]
+        assert "object" in types
+        assert "array" in types
+        assert "null" in types
+
+    async def test_run_skill_script_with_list_args_via_provider(self) -> None:
+        """End-to-end: list args flow through provider to file-based script runner."""
+        captured: dict[str, Any] = {}
+
+        def runner(skill: Any, script: Any, args: Any = None) -> str:
+            captured["args"] = args
+            return "list_result"
+
+        script = FileSkillScript(name="run.py", full_path=f"{_ABS}/test/run.py", runner=runner)
+        skill = FileSkill(
+            frontmatter=SkillFrontmatter(name="my-skill", description="test"),
+            content="Body",
+            path=f"{_ABS}/test",
+            scripts=[script],
+        )
+
+        provider = SkillsProvider([skill])
+        await _init_provider(provider)
+        run_tool = next(t for t in _ctx(provider)[2] if hasattr(t, "name") and t.name == "run_skill_script")
+        result = await run_tool.func(skill_name="my-skill", script_name="run.py", args=["input.docx", "--verbose"])
+        assert result == "list_result"
+        assert captured["args"] == ["input.docx", "--verbose"]
+
+    async def test_run_skill_script_inline_with_list_args_returns_error(self) -> None:
+        """Inline script called with list args through provider returns error (TypeError caught)."""
+        skill = InlineSkill(frontmatter=SkillFrontmatter(name="my-skill", description="test"), instructions="body")
+        skill._scripts.append(InlineSkillScript(name="s1", function=lambda: "ok"))
+
+        provider = SkillsProvider([skill])
+        await _init_provider(provider)
+        run_tool = next(t for t in _ctx(provider)[2] if hasattr(t, "name") and t.name == "run_skill_script")
+        result = await run_tool.func(skill_name="my-skill", script_name="s1", args=["arg1"])
+        assert "Error" in result
+        assert "Failed to run" in result
+
+    async def test_file_skill_content_includes_scripts_block(self) -> None:
+        """FileSkill.content appends a <scripts> block when scripts are present."""
+        script = FileSkillScript(name="run.py", full_path=f"{_ABS}/test/run.py")
+        skill = FileSkill(
+            frontmatter=SkillFrontmatter(name="my-skill", description="test"),
+            content="---\nname: my-skill\n---\nBody",
+            path=f"{_ABS}/test",
+            scripts=[script],
+        )
+        assert "<scripts>" in (await skill.get_content())
+        assert 'name="run.py"' in (await skill.get_content())
+        assert "<parameters_schema>" in (await skill.get_content())
+        assert '"type": "array"' in (await skill.get_content())
+
+    async def test_file_skill_content_no_scripts_no_block(self) -> None:
+        """FileSkill.content does not append a <scripts> block when no scripts."""
+        skill = FileSkill(
+            frontmatter=SkillFrontmatter(name="my-skill", description="test"),
+            content="---\nname: my-skill\n---\nBody",
+            path=f"{_ABS}/test",
+        )
+        assert "<scripts>" not in (await skill.get_content())
